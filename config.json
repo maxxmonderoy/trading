@@ -1,0 +1,79 @@
+{
+  "max_debate_rounds": 1,
+  "max_risk_rounds": 1,
+  "analysts": [
+    "market",
+    "sentiment",
+    "news",
+    "fundamentals"
+  ],
+  "benchmark_ticker": "SPY",
+  "reflection_horizon_days": 21,
+  "cache_ttl_minutes": 60,
+  "ohlcv_lookback_days": 365,
+  "paper": {
+    "starting_cash": 100000.0,
+    "slippage_bps": 5.0,
+    "commission_per_trade": 0.0,
+    "max_position_pct": 20.0
+  },
+  "smc": {
+    "swing_lookback": 2,
+    "sweep_return_bars": 5,
+    "mss_max_bars": 20,
+    "stop_buffer_ticks": 4,
+    "entry_mode": "ce",
+    "min_rr": 2.0,
+    "max_trades_per_session": 2,
+    "stop_after_losses": 2,
+    "risk_pct": 1.0,
+    "news_blackout_minutes": 15,
+    "kill_zones": {
+      "NY": [
+        "09:30",
+        "11:30"
+      ],
+      "London": [
+        "02:00",
+        "05:00"
+      ]
+    },
+    "eq_tolerance_ticks": 4.0,
+    "session_ranges": {
+      "Asia": [
+        "20:00",
+        "00:00"
+      ],
+      "London": [
+        "02:00",
+        "05:00"
+      ],
+      "NYAM": [
+        "09:30",
+        "11:30"
+      ]
+    },
+    "target_pool": "htf"
+  },
+  "futures": {
+    "_comment": "YOUR broker's costs. These feed every R:R and cost-drag number. Defaults are assumed retail all-in per round turn \u2014 replace with your actual fills.",
+    "costs": {
+      "ES": {
+        "commission_round_turn": 4.0,
+        "spread_ticks": 1.0
+      },
+      "MES": {
+        "commission_round_turn": 1.4,
+        "spread_ticks": 1.0
+      },
+      "NQ": {
+        "commission_round_turn": 4.0,
+        "spread_ticks": 1.0
+      },
+      "MNQ": {
+        "commission_round_turn": 1.4,
+        "spread_ticks": 1.0
+      }
+    }
+  }
+}

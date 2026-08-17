@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Entry point for the data layer. Uses the project venv so agents never have to
+# think about interpreters or PATH.
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [ -f "$ROOT/.env" ]; then set -a; . "$ROOT/.env"; set +a; fi
+exec "$ROOT/.venv/bin/python" "$ROOT/tools/ta.py" "$@"

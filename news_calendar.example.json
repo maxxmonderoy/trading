@@ -1,0 +1,6 @@
+[
+  {"datetime": "2026-08-12 08:30", "event": "CPI"},
+  {"datetime": "2026-09-04 08:30", "event": "NFP"},
+  {"datetime": "2026-09-16 14:00", "event": "FOMC rate decision"},
+  {"datetime": "2026-09-16 14:30", "event": "FOMC press conference"}
+]

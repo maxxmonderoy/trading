@@ -1,0 +1,25 @@
+# Environment
+.venv/
+__pycache__/
+*.pyc
+.env
+.DS_Store
+
+# Your data — never publish.
+# NOTE: git does not support trailing comments on pattern lines.
+# Keep every comment on its own line or the pattern silently breaks.
+
+# portfolio, trades, equity curve
+paper/
+
+# decision log with outcomes and lessons
+memory/decisions.jsonl
+
+# analysis run artifacts
+results/
+
+# your event calendar
+news_calendar.json
+
+# fetched market data
+data_cache/
