@@ -19,6 +19,7 @@ replace the CLI, and a keyless Python CLI replaces the LangChain tool bindings.
 .claude/commands/      /analyze, /quick, /reflect
 tools/ta.py            the data layer CLI (argparse dispatcher)
 tools/dataflows/       market, fundamentals, news, social, macro, memory, paper, futures, smc
+tests/                 offline tests for the data layer's decision logic
 bin/ta                 → entry point (activates .venv, loads .env)
 config.json            debate rounds, analyst roster, benchmark, horizon
 results/<TICKER>/<DATE>/   run artifacts (the state dict, as files)
@@ -183,6 +184,21 @@ Failures return `<unavailable: source — reason>` on stdout with a zero exit co
 by design: an agent that sees a placeholder reports a gap, while an agent that
 sees a traceback tends to route around it and invent the number.
 
+**"Fetch failed" and "no data" are separate outcomes, and the CLI keeps them
+apart.** yfinance catches transport errors internally and returns an empty
+frame, so without help an outage is indistinguishable from a delisted ticker —
+and an analyst told "no estimate data for AAPL" will treat that as a finding
+rather than a gap. Two mechanisms recover the difference:
+
+- `raise_if_fetch_failed()` reads the console noise captured during a
+  `yf.download` and raises `FetchError` when it describes a transport failure.
+  A delisting notice passes through untouched — that request completed.
+- `unavailable_empty()` covers the paths that fail silently (the statement and
+  estimate properties emit nothing at all) by probing the vendor once, and only
+  after a result has already come back empty.
+
+Any new dataflow that can return an empty result must use one of the two.
+
 ## What changed from upstream, and why
 
 | Upstream | Here | Why |
@@ -207,6 +223,13 @@ sees a traceback tends to route around it and invent the number.
 - **Test data commands live** before shipping them — vendor APIs change shape
   without notice, and a command that silently returns nothing is worse than one
   that errors.
+- **`tests/` covers the reasoning, not the vendors.** `.venv/bin/python -m
+  unittest discover tests -v` runs offline with no keys and no test dependency
+  (pytest works too if you have it, but it is deliberately not in
+  `requirements.txt`). It pins the things that are supposed to be invariant — the look-ahead
+  truncation, the fetch-failure distinction, the position cap, the outcome
+  verdicts, the `<unavailable:>` shape. Vendor response shapes are deliberately
+  not asserted; that is what `bin/ta doctor` and a live run are for.
 - **Preserve the no-look-ahead guarantee** in any new dataflow. Filter on
   `curr_date`, and prefer sources that carry publication dates.
 - Only FRED needs a key. Keep it that way if you add sources — the setup cost of

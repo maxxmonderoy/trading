@@ -154,6 +154,110 @@ def unavailable(source: str, reason: str) -> str:
     return f"<unavailable: {source} — {reason}>"
 
 
+# ---------------------------------------------------------------------------
+# Fetch failure vs. genuine absence
+# ---------------------------------------------------------------------------
+#
+# Rule 2 of this project turns on a distinction the vendor libraries do not
+# make: "the source returned nothing" and "the source could not be reached" are
+# different findings, and only the second one is a gap. yfinance collapses them
+# — a transport error is caught internally and handed back as an empty frame,
+# so an outage is indistinguishable from a delisted ticker at the call site.
+#
+# Two mechanisms recover the difference:
+#
+#   `raise_if_fetch_failed` reads the console noise yfinance emits during
+#   `yf.download` and raises when it describes a transport failure.
+#
+#   `unavailable_empty` covers the paths that emit nothing at all (the
+#   statement and estimate properties fail completely silently) by probing the
+#   vendor once, and only when a result already came back empty.
+
+
+class FetchError(RuntimeError):
+    """A source could not be reached. Distinct from a source that had no data."""
+
+
+# Substrings that mean the request never completed. Checked before the
+# no-data markers, because yfinance often prints both when the network is down.
+_TRANSPORT_MARKERS = (
+    "connectionerror", "connecttimeout", "readtimeout", "timeout",
+    "max retries", "httperror", "sslerror", "proxyerror", "tunnel failed",
+    "failed to perform", "ratelimit", "too many requests",
+    "curl:", "temporary failure in name resolution", "nodename nor servname",
+)
+
+# Substrings that mean the request completed and the answer was "nothing here".
+_NO_DATA_MARKERS = (
+    "possibly delisted", "no price data found", "no data found",
+)
+
+
+def _first_meaningful_line(text: str, limit: int = 200) -> str:
+    for line in text.splitlines():
+        line = line.strip()
+        if line:
+            return line[:limit]
+    return "no diagnostic returned"
+
+
+def raise_if_fetch_failed(noise: str, source: str) -> None:
+    """Raise `FetchError` when captured vendor output describes a transport failure.
+
+    `noise` is whatever the vendor wrote to stdout/stderr during the call. An
+    empty frame plus transport noise is an outage; an empty frame plus a
+    delisting notice is a real answer and passes through untouched.
+    """
+    if not noise:
+        return
+    lowered = noise.lower()
+    if not any(marker in lowered for marker in _TRANSPORT_MARKERS):
+        return
+    if any(marker in lowered for marker in _NO_DATA_MARKERS) and "curl:" not in lowered:
+        return
+    raise FetchError(f"{source} fetch failed — {_first_meaningful_line(noise)}")
+
+
+_reachability_cache: dict[str, bool] = {}
+
+
+def source_reachable(url: str = "https://query2.finance.yahoo.com", timeout: float = 6.0) -> bool:
+    """Is the vendor answering at all? Memoised for the life of the process.
+
+    Called only after a fetch has already come back empty, so it costs nothing
+    on the happy path. Any HTTP response counts as reachable — a 404 or a 429
+    means the host is up and the problem is the request, whereas a connection
+    error means the source is simply not there.
+    """
+    if url in _reachability_cache:
+        return _reachability_cache[url]
+    try:
+        import requests
+
+        requests.head(url, timeout=timeout, allow_redirects=True)
+        reachable = True
+    except Exception:  # noqa: BLE001 — any failure to connect is the answer
+        reachable = False
+    _reachability_cache[url] = reachable
+    return reachable
+
+
+def unavailable_empty(source: str, detail: str) -> str:
+    """`unavailable()` for an empty result, upgraded when the vendor is unreachable.
+
+    Use this wherever a fetch returned no rows without raising. If the vendor is
+    down, the report says so; otherwise the caller's own explanation stands.
+    """
+    if not source_reachable():
+        return unavailable(
+            source,
+            "fetch failed — the data vendor is unreachable from this machine "
+            "(network, proxy, or vendor outage). No conclusion can be drawn "
+            "about the symbol from this; treat it as a missing source",
+        )
+    return unavailable(source, detail)
+
+
 def fmt_num(value, digits: int = 2) -> str:
     if value is None:
         return "N/A"

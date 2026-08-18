@@ -20,6 +20,7 @@ from .common import (
     normalize_symbol,
     parse_date,
     unavailable,
+    unavailable_empty,
 )
 
 
@@ -43,7 +44,7 @@ def _statement(symbol: str, kind: str, quarterly: bool, curr_date: str) -> str:
     except Exception as exc:
         return unavailable(f"yfinance {kind}", f"{type(exc).__name__}: {exc}")
     if frame is None or frame.empty:
-        return unavailable(f"yfinance {kind}", f"no data for {symbol}")
+        return unavailable_empty(f"yfinance {kind}", f"no data for {symbol}")
 
     # Columns are period-end dates; drop any period ending after the analysis date.
     cutoff = pd.to_datetime(curr_date)
@@ -132,7 +133,7 @@ def overview(symbol: str, curr_date: str) -> str:
     except Exception as exc:
         return unavailable("yfinance fundamentals", f"{type(exc).__name__}: {exc}")
     if not info or len(info) < 5:
-        return unavailable("yfinance fundamentals", f"empty profile for {symbol}")
+        return unavailable_empty("yfinance fundamentals", f"empty profile for {symbol}")
 
     sections = [
         _section("Company profile", info, _PROFILE_FIELDS),
@@ -188,7 +189,7 @@ def estimates(symbol: str, curr_date: str, price: float | None = None) -> str:
     revisions = _fetch("get_eps_revisions")
 
     if earnings is None and revenue is None:
-        return unavailable("yfinance analyst estimates", f"no estimate data for {symbol}")
+        return unavailable_empty("yfinance analyst estimates", f"no estimate data for {symbol}")
 
     sections = []
 
@@ -310,14 +311,14 @@ def earnings_reactions(symbol: str, curr_date: str, limit: int = 12) -> str:
     except Exception as exc:
         return unavailable("yfinance earnings dates", f"{type(exc).__name__}: {exc}")
     if dates is None or dates.empty:
-        return unavailable("earnings reactions", f"no earnings history for {symbol}")
+        return unavailable_empty("earnings reactions", f"no earnings history for {symbol}")
 
     try:
         data = load_ohlcv(symbol, curr_date, 1500)
     except Exception as exc:
         return unavailable("earnings reactions", f"price history failed: {type(exc).__name__}: {exc}")
     if data.empty:
-        return unavailable("earnings reactions", f"no price history for {symbol}")
+        return unavailable_empty("earnings reactions", f"no price history for {symbol}")
 
     cutoff = pd.to_datetime(curr_date)
     rows, moves = [], []
@@ -399,7 +400,7 @@ def earnings_calendar(symbol: str, curr_date: str) -> str:
     except Exception as exc:
         return unavailable("yfinance earnings dates", f"{type(exc).__name__}: {exc}")
     if dates is None or dates.empty:
-        return unavailable("yfinance earnings dates", f"no earnings calendar for {symbol}")
+        return unavailable_empty("yfinance earnings dates", f"no earnings calendar for {symbol}")
 
     rows = []
     for index, row in dates.iterrows():

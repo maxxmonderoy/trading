@@ -557,6 +557,13 @@ def main() -> int:
         output = dispatch(args)
     except KeyboardInterrupt:
         return 130
+    except common.FetchError as exc:
+        # A source that could not be reached is a gap, not an error: render it in
+        # the shape agents are instructed to surface, so it lands in the report
+        # instead of being routed around. Zero exit code for the same reason
+        # every other `unavailable` result has one.
+        print(common.unavailable("data source", str(exc)))
+        return 0
     except Exception as exc:  # noqa: BLE001 — a traceback on stdout would be read as data
         print(f"<error: {type(exc).__name__}: {exc}>")
         return 1

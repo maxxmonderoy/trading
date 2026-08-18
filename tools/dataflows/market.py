@@ -23,6 +23,7 @@ from contextlib import redirect_stderr, redirect_stdout
 import pandas as pd
 
 from .common import (
+    FetchError,
     cache_path,
     days_before,
     fmt_num,
@@ -30,8 +31,10 @@ from .common import (
     markdown_table,
     normalize_symbol,
     parse_date,
+    raise_if_fetch_failed,
     today,
     unavailable,
+    unavailable_empty,
 )
 
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -61,10 +64,14 @@ SUPPORTED_INDICATORS = {
 
 
 def _download(symbol: str, start: str, end: str) -> pd.DataFrame:
-    """yfinance download with its console chatter suppressed.
+    """yfinance download with its console chatter captured, not discarded.
 
     yfinance writes progress bars and error banners to stdout/stderr. This CLI's
-    stdout is an agent's tool result, so it has to stay clean.
+    stdout is an agent's tool result, so the chatter has to be kept off it — but
+    it is also the only place a transport failure is reported, since yfinance
+    catches the error and returns an empty frame. Capture it, then let
+    `raise_if_fetch_failed` decide whether the empty frame is an outage or an
+    answer.
     """
     import yfinance as yf
 
@@ -79,6 +86,7 @@ def _download(symbol: str, start: str, end: str) -> pd.DataFrame:
             multi_level_index=False,
         )
     if data is None or data.empty:
+        raise_if_fetch_failed(buffer.getvalue(), f"yfinance OHLCV for {symbol}")
         return pd.DataFrame()
     data = data.reset_index()
     if isinstance(data.columns, pd.MultiIndex):
@@ -148,10 +156,14 @@ def price_history(symbol: str, curr_date: str, look_back_days: int = 60) -> str:
     symbol = normalize_symbol(symbol)
     try:
         data = load_ohlcv(symbol, curr_date, max(look_back_days, 250))
-    except Exception as exc:  # network, parse, or symbol errors
+    except FetchError as exc:
+        return unavailable("yfinance OHLCV", str(exc))
+    except Exception as exc:  # parse or symbol errors
         return unavailable("yfinance OHLCV", f"{type(exc).__name__}: {exc}")
     if data.empty:
-        return unavailable("yfinance OHLCV", f"no rows returned for {symbol} on or before {curr_date}")
+        return unavailable_empty(
+            "yfinance OHLCV", f"no rows returned for {symbol} on or before {curr_date}"
+        )
 
     window = data.tail(look_back_days)
     rows = [
@@ -184,10 +196,14 @@ def indicators(symbol: str, curr_date: str, names: list[str], look_back_days: in
 
     try:
         data = load_ohlcv(symbol, curr_date)
+    except FetchError as exc:
+        return unavailable("yfinance OHLCV", str(exc))
     except Exception as exc:
         return unavailable("yfinance OHLCV", f"{type(exc).__name__}: {exc}")
     if data.empty:
-        return unavailable("indicators", f"no OHLCV rows for {symbol} on or before {curr_date}")
+        return unavailable_empty(
+            "indicators", f"no OHLCV rows for {symbol} on or before {curr_date}"
+        )
 
     frame = wrap(data.copy())
     columns: dict[str, list[str]] = {}
@@ -220,10 +236,14 @@ def snapshot(symbol: str, curr_date: str, look_back_days: int = 30) -> str:
     symbol = normalize_symbol(symbol)
     try:
         data = load_ohlcv(symbol, curr_date)
+    except FetchError as exc:
+        return unavailable("verified snapshot", str(exc))
     except Exception as exc:
         return unavailable("verified snapshot", f"{type(exc).__name__}: {exc}")
     if data.empty:
-        return unavailable("verified snapshot", f"no OHLCV rows for {symbol} on or before {curr_date}")
+        return unavailable_empty(
+            "verified snapshot", f"no OHLCV rows for {symbol} on or before {curr_date}"
+        )
 
     latest = data.iloc[-1]
     frame = wrap(data.copy())

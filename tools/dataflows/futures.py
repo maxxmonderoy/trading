@@ -30,7 +30,16 @@ from dataclasses import dataclass
 
 import pandas as pd
 
-from .common import cache_read, cache_write, fmt_num, load_config, markdown_table, today, unavailable
+from .common import (
+    cache_read,
+    cache_write,
+    fmt_num,
+    load_config,
+    markdown_table,
+    raise_if_fetch_failed,
+    today,
+    unavailable,
+)
 
 EASTERN = "America/New_York"
 
@@ -170,6 +179,10 @@ def intraday(spec: ContractSpec, interval: str = "5m", days: int | None = None,
                 progress=False, auto_adjust=False, multi_level_index=False,
             )
         if frame is None or frame.empty:
+            # An empty intraday frame is expected outside the rolling window
+            # yfinance serves, but it is also what a network failure looks like.
+            # Only the captured noise can tell those apart.
+            raise_if_fetch_failed(buffer.getvalue(), f"{spec.data_symbol} {interval} bars")
             return pd.DataFrame()
         if frame.index.tz is None:
             frame.index = frame.index.tz_localize("UTC")

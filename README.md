@@ -30,6 +30,17 @@ Check the wiring any time with `bin/ta doctor` — it verifies dependencies, eve
 subagent definition, the slash commands, and that no documentation references a
 `bin/ta` subcommand that does not exist.
 
+The data layer's decision logic has its own tests, which run offline:
+
+```bash
+.venv/bin/python -m unittest discover tests -v
+```
+
+They cover the parts that must not drift — look-ahead truncation, the position
+cap, outcome scoring, and the distinction between a source that failed and a
+source that had nothing. Vendor response shapes are not asserted; `doctor` and a
+live run are what catch those.
+
 ## Use
 
 ```

@@ -25,7 +25,6 @@ from datetime import datetime
 from .common import (
     ROOT,
     asset_type,
-    benchmark_for,
     fmt_num,
     load_config,
     markdown_table,
@@ -193,18 +192,34 @@ def buy(
     fill = _fill_price(market_price, "buy", settings["slippage_bps"])
     equity, _, _ = _equity(book, date)
 
+    max_pct = float(settings["max_position_pct"])
     if shares is None:
         if size_pct is None:
             return "<error: pass either --size-pct or --shares>"
-        if size_pct > settings["max_position_pct"]:
+        if size_pct > max_pct:
             return (
-                f"<error: {size_pct}% exceeds the {settings['max_position_pct']}% max position size. "
+                f"<error: {size_pct}% exceeds the {max_pct}% max position size. "
                 "Raise `paper.max_position_pct` in config.json if this is intentional.>"
             )
         shares = _round_shares(symbol, equity * (size_pct / 100) / fill)
 
     if shares <= 0:
         return f"<error: computed size is 0 shares — equity {fmt_num(equity)} is too small for a {size_pct}% position at {fmt_num(fill)}>"
+
+    # The cap is on the resulting position, not on the order. Checking only the
+    # order lets two 20% buys build a 40% position, and lets `--shares` past the
+    # limit entirely — which is exactly the concentration the cap exists to stop.
+    existing = book["positions"].get(symbol)
+    existing_shares = existing["shares"] if existing else 0.0
+    resulting_pct = (existing_shares + shares) * fill / equity * 100 if equity > 0 else 0.0
+    if resulting_pct > max_pct + 1e-9:
+        return (
+            f"<error: this fill would take {symbol} to {resulting_pct:.1f}% of equity, past the "
+            f"{max_pct}% max position size"
+            + (f" ({existing_shares:g} shares already held)" if existing_shares else "")
+            + ". Reduce the size, or raise `paper.max_position_pct` in config.json if this is "
+            "intentional.>"
+        )
 
     commission = float(settings["commission_per_trade"])
     cost = shares * fill + commission
@@ -369,7 +384,9 @@ def status(date: str | None = None) -> str:
         rows,
     ) if rows else "_No open positions._")
 
-    benchmark = benchmark_for("SPY", book["settings"].get("benchmark", "SPY"))
+    # The book's own settings block holds execution parameters only; the
+    # benchmark is a project-level setting.
+    benchmark = load_config().get("benchmark_ticker", "SPY")
     bench_line = _benchmark_comparison(book, date, total_return, benchmark)
 
     lines.extend([
