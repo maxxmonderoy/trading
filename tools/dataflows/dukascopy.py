@@ -146,6 +146,57 @@ def ticks_to_bars(ticks: list[tuple], interval: str = "1min") -> "pd.DataFrame":
     return bars.dropna(subset=["open", "high", "low", "close"])
 
 
+def build(instrument: str = "NAS100") -> str:
+    """Build the CSV from whatever hours are already cached.
+
+    Separate from `download` on purpose. A long download can be interrupted —
+    process exit, network, an impatient ctrl-C — and an earlier version of this
+    module only wrote the CSV after the whole range finished, so 162 successfully
+    fetched hours produced nothing. Cached bytes should always be convertible
+    into usable data without touching the network.
+    """
+    import pandas as pd
+
+    if instrument not in INSTRUMENTS:
+        return f"<error: unknown instrument {instrument!r}. Options: {', '.join(INSTRUMENTS)}>"
+    symbol, divisor, label = INSTRUMENTS[instrument]
+
+    cache = RAW_DIR / symbol
+    if not cache.exists():
+        return f"<error: nothing cached for {instrument}. Run `bin/ta duka download {instrument}` first.>"
+
+    all_ticks: list[tuple] = []
+    files = sorted(cache.glob("*.bi5"))
+    for path in files:
+        if path.stat().st_size == 0:
+            continue
+        stem = path.stem                       # YYYYMMDD_HH
+        try:
+            day = dt.date(int(stem[0:4]), int(stem[4:6]), int(stem[6:8]))
+            hour = int(stem[9:11])
+        except (ValueError, IndexError):
+            continue
+        all_ticks.extend(decode(path.read_bytes(), day, hour, divisor))
+
+    if not all_ticks:
+        return f"<error: {len(files)} cached files but no decodable ticks for {instrument}.>"
+
+    all_ticks.sort(key=lambda t: t[0])
+    bars = ticks_to_bars(all_ticks, "1min")
+    out = ROOT / "data" / f"{instrument}_1m.csv"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    frame = bars.reset_index().rename(columns={"ts": "timestamp"})
+    frame["timestamp"] = frame["timestamp"].dt.tz_localize(None)
+    frame.to_csv(out, index=False)
+
+    sessions = bars.index.normalize().nunique()
+    return (
+        f"Built `{out.relative_to(ROOT)}` from {len(files)} cached hours: "
+        f"**{len(all_ticks):,} ticks → {len(bars):,} 1m bars over {sessions} sessions** "
+        f"({bars.index[0]:%Y-%m-%d} → {bars.index[-1]:%Y-%m-%d} ET)."
+    )
+
+
 def download(instrument: str = "NAS100", start: str = "", end: str = "",
              delay: float = 2.5, hours: tuple[int, ...] | None = None) -> str:
     """Download a date range and write `data/<instrument>_1m.csv`.
@@ -180,6 +231,13 @@ def download(instrument: str = "NAS100", start: str = "", end: str = "",
                         fetched += 1
                         continue
                 empty += 1
+            # Flush to CSV periodically. A run this long will sometimes be
+            # interrupted, and partial output beats none.
+            if days % 10 == 0:
+                try:
+                    build(instrument)
+                except Exception:
+                    pass
         day += dt.timedelta(days=1)
 
     if not all_ticks:

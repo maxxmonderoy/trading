@@ -265,6 +265,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     duka_sub.add_parser("list", help="Available instruments")
 
+    q = duka_sub.add_parser("build", help="Build the CSV from already-cached hours (no network)")
+    q.add_argument("instrument", nargs="?", default="NAS100")
+
     q = duka_sub.add_parser("download", help="Download a date range to data/<INSTRUMENT>_1m.csv")
     q.add_argument("instrument", nargs="?", default="NAS100", help="NAS100, SPX500, EURUSD, GBPUSD")
     q.add_argument("--start", default="", help="YYYY-MM-DD (default: 30 days ago)")
@@ -560,6 +563,8 @@ def dispatch(args: argparse.Namespace) -> str:
                     + common.markdown_table(["Use", "Feed symbol", "Description"], rows)
                     + "\n\n> Index CFDs track the index, not the futures contract: no roll gaps, "
                       "but a basis to NQ/ES means exact levels do not transfer.")
+        if args.duka_command == "build":
+            return dukascopy.build(args.instrument)
         hours = tuple(range(13, 21)) if args.rth_only else None
         return dukascopy.download(args.instrument, args.start, args.end, args.delay, hours)
 
