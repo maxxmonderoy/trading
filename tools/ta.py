@@ -247,6 +247,35 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--sessions", type=int, default=20)
     _add_date(q)
 
+    # ---- backtest ---------------------------------------------------------
+    p = sub.add_parser("bt", help="Backtest on backtrader: run, walk-forward, null model")
+    bt_sub = p.add_subparsers(dest="bt_command", required=True)
+
+    q = bt_sub.add_parser("data", help="What data is loaded and whether it is enough")
+    q.add_argument("symbol", nargs="?", default="NQ")
+    q.add_argument("--interval", default="5m")
+    q.add_argument("--csv", default=None, help="Vendor CSV (ET timestamps + OHLCV)")
+
+    q = bt_sub.add_parser("run", help="Single-pass backtest with honest statistics")
+    q.add_argument("symbol", nargs="?", default="NQ")
+    q.add_argument("--interval", default="5m")
+    q.add_argument("--csv", default=None)
+    q.add_argument("--partial", action="store_true", help="Take half off at 1R, stop to breakeven")
+
+    q = bt_sub.add_parser("walkforward", help="Fit on each fold, report the next fold's out-of-sample result")
+    q.add_argument("symbol", nargs="?", default="NQ")
+    q.add_argument("--interval", default="5m")
+    q.add_argument("--csv", default=None)
+    q.add_argument("--folds", type=int, default=4)
+    q.add_argument("--partial", action="store_true")
+
+    q = bt_sub.add_parser("null", help="Coin-flip direction baseline the strategy must beat")
+    q.add_argument("symbol", nargs="?", default="NQ")
+    q.add_argument("--interval", default="5m")
+    q.add_argument("--csv", default=None)
+    q.add_argument("--trials", type=int, default=20)
+    q.add_argument("--partial", action="store_true")
+
     # ---- paper trading ----------------------------------------------------
     p = sub.add_parser("paper", help="Paper trading book: execute, mark, and track a simulated portfolio")
     paper_sub = p.add_subparsers(dest="paper_command", required=True)
@@ -493,6 +522,24 @@ def dispatch(args: argparse.Namespace) -> str:
             return smc.rules_report(args.symbol, args.interval, args.sessions, args.account, date)
         if sub == "sensitivity":
             return smc.sensitivity(args.symbol, args.interval, args.sessions, date)
+
+    if command == "bt":
+        from backtest import engine as bt_engine
+        from backtest.feeds import describe as bt_describe, load as bt_load
+        sub = args.bt_command
+        if sub == "data":
+            bars, prov = bt_load(args.symbol, args.interval, args.csv)
+            return "## Backtest data\n\n" + bt_describe(bars, prov)
+        if sub == "run":
+            return bt_engine.report(args.symbol, args.interval, args.csv, args.partial)
+        if sub == "walkforward":
+            bars, prov = bt_load(args.symbol, args.interval, args.csv)
+            return bt_describe(bars, prov) + "\n\n" + bt_engine.walk_forward(
+                bars, args.symbol, args.folds, partial=args.partial)
+        if sub == "null":
+            bars, prov = bt_load(args.symbol, args.interval, args.csv)
+            return bt_describe(bars, prov) + "\n\n" + bt_engine.null_model(
+                bars, args.symbol, args.trials, args.partial)
 
     if command == "paper":
         sub = args.paper_command

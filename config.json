@@ -53,7 +53,8 @@
         "11:30"
       ]
     },
-    "target_pool": "htf"
+    "target_pool": "htf",
+    "cancel_at_zone_end": false
   },
   "futures": {
     "_comment": "YOUR broker's costs. These feed every R:R and cost-drag number. Defaults are assumed retail all-in per round turn \u2014 replace with your actual fills.",

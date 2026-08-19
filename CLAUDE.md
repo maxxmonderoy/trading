@@ -19,6 +19,8 @@ replace the CLI, and a keyless Python CLI replaces the LangChain tool bindings.
 .claude/commands/      /analyze, /quick, /reflect
 tools/ta.py            the data layer CLI (argparse dispatcher)
 tools/dataflows/       market, fundamentals, news, social, macro, memory, paper, futures, smc
+tools/backtest/        backtrader harness: feeds, strategy, engine
+data/                  vendor CSVs (gitignored) — see data/README.md
 bin/ta                 → entry point (activates .venv, loads .env)
 config.json            debate rounds, analyst roster, benchmark, horizon
 results/<TICKER>/<DATE>/   run artifacts (the state dict, as files)
@@ -169,6 +171,13 @@ bin/ta smc scan NQ --sessions 20  # run the four-step state machine
 bin/ta smc rules NQ --account 10000  # with section 4 enforced and sized
 bin/ta smc sensitivity NQ         # how setup count moves with the ambiguous params
 bin/ta smc swings NQ / smc fvg NQ
+bin/ta smc replay NQ --until 10:15   # calibration: future withheld, then --reveal
+
+# Backtest (backtrader) — the gate on whether any of this is real
+bin/ta bt data NQ                    # what data is loaded, and whether it is enough
+bin/ta bt run NQ                     # single pass, net of costs, with n and t-stat
+bin/ta bt walkforward NQ             # fit on a fold, report the NEXT fold's result
+bin/ta bt null NQ                    # coin-flip-direction baseline it must beat
 bin/ta memory recall --ticker NVDA --query "..."
 bin/ta memory log|score|lesson|history|stats|pending|show
 bin/ta paper init|buy|sell|status|mark|history|equity

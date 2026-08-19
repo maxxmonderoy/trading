@@ -23,3 +23,5 @@ news_calendar.json
 
 # fetched market data
 data_cache/
+data/*
+!data/README.md

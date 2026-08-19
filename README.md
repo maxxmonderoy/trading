@@ -65,6 +65,9 @@ bin/ta earnings-reactions NVDA           # gap-risk base rate from past prints
 bin/ta regime                            # indices, VIX, rates, dollar, commodities
 bin/ta predictions "fed rate cut"        # Polymarket implied odds
 bin/ta memory stats                      # the desk's track record
+bin/ta bt run NQ                         # backtest, net of costs, with honest stats
+bin/ta bt walkforward NQ                 # out-of-sample validation
+bin/ta bt null NQ                        # random-direction baseline
 bin/ta --help
 ```
 
