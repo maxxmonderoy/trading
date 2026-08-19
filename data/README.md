@@ -1,6 +1,25 @@
 # Market data
 
-## What to buy
+## Free option first
+
+`bin/ta duka download NAS100 --start 2025-08-19 --end 2026-08-18`
+
+Dukascopy publishes free historical tick data at a predictable URL going back
+years. Ticks are aggregated to 1-minute bars and written straight to
+`data/NAS100_1m.csv`, which the backtest picks up automatically.
+
+**These are index CFDs, not futures.** `NAS100` tracks the Nasdaq 100 and
+`SPX500` the S&P 500. No quarterly roll (an advantage — no gaps to stitch), but
+the series sits at a basis to NQ/ES, so exact levels do not transfer
+tick-for-tick. Good enough to answer whether sweep → MSS → FVG has an edge on
+the Nasdaq; not a substitute for NQ futures data once you intend to trade the
+contract.
+
+Be patient with it. The default 2-second pacing is deliberate — bursting gets
+the IP throttled. Downloads are cached and resumable, so an interrupted run
+costs nothing.
+
+## What to buy (if the free data says the edge is real)
 
 **1-minute bars, continuous front-month, 2+ years.**
 

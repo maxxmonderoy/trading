@@ -179,6 +179,10 @@ bin/ta smc sensitivity NQ         # how setup count moves with the ambiguous par
 bin/ta smc swings NQ / smc fvg NQ
 bin/ta smc replay NQ --until 10:15   # calibration: future withheld, then --reveal
 
+# Free historical data — years of 1m bars, no purchase
+bin/ta duka list
+bin/ta duka download NAS100 --start 2025-08-19 --end 2026-08-18
+
 # Backtest (backtrader) — the gate on whether any of this is real
 bin/ta bt data NQ                    # what data is loaded, and whether it is enough
 bin/ta bt run NQ                     # single pass, net of costs, with n and t-stat

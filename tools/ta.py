@@ -25,8 +25,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from dataflows import (  # noqa: E402
-    calendar, common, doctor, fundamentals, futures, macro, market, memory, news, paper,
-    smc, social,
+    calendar, common, doctor, dukascopy, fundamentals, futures, macro, market, memory,
+    news, paper, smc, social,
 )
 
 
@@ -258,6 +258,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     q = cal_sub.add_parser("show", help="What the blackout rule will act on")
     q.add_argument("--limit", type=int, default=20)
+
+    # ---- free historical data ---------------------------------------------
+    p = sub.add_parser("duka", help="Free historical tick data from Dukascopy (index CFDs + FX)")
+    duka_sub = p.add_subparsers(dest="duka_command", required=True)
+
+    duka_sub.add_parser("list", help="Available instruments")
+
+    q = duka_sub.add_parser("download", help="Download a date range to data/<INSTRUMENT>_1m.csv")
+    q.add_argument("instrument", nargs="?", default="NAS100", help="NAS100, SPX500, EURUSD, GBPUSD")
+    q.add_argument("--start", default="", help="YYYY-MM-DD (default: 30 days ago)")
+    q.add_argument("--end", default="", help="YYYY-MM-DD (default: yesterday)")
+    q.add_argument("--delay", type=float, default=2.5, help="Seconds between requests — be polite")
+    q.add_argument("--rth-only", action="store_true", help="Only 13:00-21:00 UTC (US cash session), ~3x faster")
 
     # ---- backtest ---------------------------------------------------------
     p = sub.add_parser("bt", help="Backtest on backtrader: run, walk-forward, null model")
@@ -539,6 +552,16 @@ def dispatch(args: argparse.Namespace) -> str:
         if args.cal_command == "update":
             return calendar.update(tuple(e.strip().upper() for e in args.events.split(",")), args.future_only)
         return calendar.show(args.limit)
+
+    if command == "duka":
+        if args.duka_command == "list":
+            rows = [[k, v[0], v[2]] for k, v in dukascopy.INSTRUMENTS.items()]
+            return ("## Dukascopy instruments\n\n"
+                    + common.markdown_table(["Use", "Feed symbol", "Description"], rows)
+                    + "\n\n> Index CFDs track the index, not the futures contract: no roll gaps, "
+                      "but a basis to NQ/ES means exact levels do not transfer.")
+        hours = tuple(range(13, 21)) if args.rth_only else None
+        return dukascopy.download(args.instrument, args.start, args.end, args.delay, hours)
 
     if command == "bt":
         from backtest import engine as bt_engine
