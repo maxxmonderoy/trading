@@ -311,6 +311,7 @@ def scan_session(
     session_date: pd.Timestamp,
     targets: dict[str, float],
     config: dict,
+    htf_frames: dict | None = None,
 ) -> list[Setup]:
     """Walk one session bar by bar through the state machine.
 
@@ -451,6 +452,14 @@ def scan_session(
             reward_points = abs(target - entry)
             rr = reward_points / risk_points
 
+            # Step 1 gate: the HTF bias that existed when this setup formed.
+            htf = None
+            if htf_frames and config.get("require_htf_alignment", True):
+                htf = bias_at(htf_frames, timestamp, config)
+                if not aligned(htf["bias"], direction):
+                    state, swept = "MONITOR_HTF_LEVELS", None
+                    continue
+
             setup = Setup(
                 session_date=str(session_date.date()),
                 direction=direction,
@@ -486,6 +495,12 @@ def scan_session(
                 state, swept = "MONITOR_HTF_LEVELS", None
                 continue
 
+            if htf:
+                setup.notes.append(
+                    f"HTF bias {htf['bias']} ("
+                    + ", ".join(f"{k} {v}" for k, v in htf["readings"].items())
+                    + f") — {direction} aligned."
+                )
             _resolve_outcome(setup, frame, i, tick)
             setups.append(setup)
             state, swept = "MONITOR_HTF_LEVELS", None
@@ -608,8 +623,13 @@ def scan(symbol: str, interval: str = "5m", sessions: int = 10,
             "no intraday bars — this framework cannot run without them",
         )
 
-    tagged = _tag_sessions(frame)
+    tagged = _tag_sessions(frame, spec)
     all_sessions = sorted(tagged["session_date"].unique())[-sessions:]
+
+    htf_frames = (
+        load_htf_frames(spec, curr_date, tuple(config.get("htf_intervals", ("1h", "15m"))))
+        if config.get("require_htf_alignment", True) else None
+    )
 
     all_setups: list[Setup] = []
     for session_date in all_sessions:
@@ -618,7 +638,7 @@ def scan(symbol: str, interval: str = "5m", sessions: int = 10,
         if not targets:
             continue
         all_setups.extend(
-            scan_session(session_frame, spec, session_date, targets, config)
+            scan_session(session_frame, spec, session_date, targets, config, htf_frames)
         )
 
     if not all_setups:
@@ -638,8 +658,8 @@ def scan(symbol: str, interval: str = "5m", sessions: int = 10,
     for s in taken:
         rows.append([
             s.session_date, s.kill_zone, s.direction.upper(),
-            s.liquidity_level_name, f"{s.sweep_extreme:,.2f}",
-            f"{s.entry:,.2f}", f"{s.stop:,.2f}", f"{s.target:,.2f}",
+            s.liquidity_level_name, spec.px(s.sweep_extreme),
+            spec.px(s.entry), spec.px(s.stop), spec.px(s.target),
             f"{s.risk_ticks:.0f}", f"{s.rr:.2f}", s.outcome,
         ])
 
@@ -693,14 +713,14 @@ def _setup_detail(setup: Setup, spec: ContractSpec) -> str:
     lines = [
         f"**{setup.session_date} — {setup.direction.upper()} ({setup.kill_zone} kill zone)** → `{setup.outcome}`",
         "",
-        f"1. **Liquidity target**: {setup.liquidity_level_name} at {setup.liquidity_level_price:,.2f}",
-        f"2. **Sweep**: {setup.sweep_time}, extreme {setup.sweep_extreme:,.2f}, "
+        f"1. **Liquidity target**: {setup.liquidity_level_name} at {spec.px(setup.liquidity_level_price)}",
+        f"2. **Sweep**: {setup.sweep_time}, extreme {spec.px(setup.sweep_extreme)}, "
         f"closed back through in {setup.sweep_return_bars} bar(s)",
-        f"3. **MSS**: {setup.mss_time}, close {setup.mss_close:,.2f} through the opposing swing at {setup.mss_level:,.2f}",
-        f"4. **FVG**: {setup.fvg_time}, gap {setup.fvg_bottom:,.2f}–{setup.fvg_top:,.2f}, "
-        f"entry at {setup.entry:,.2f}",
+        f"3. **MSS**: {setup.mss_time}, close {spec.px(setup.mss_close)} through the opposing swing at {spec.px(setup.mss_level)}",
+        f"4. **FVG**: {setup.fvg_time}, gap {spec.px(setup.fvg_bottom)}–{spec.px(setup.fvg_top)}, "
+        f"entry at {spec.px(setup.entry)}",
         "",
-        f"   Stop {setup.stop:,.2f} | target {setup.target:,.2f} ({setup.target_name}) | "
+        f"   Stop {spec.px(setup.stop)} | target {spec.px(setup.target)} ({setup.target_name}) | "
         f"risk {setup.risk_ticks:.0f} ticks (${risk_dollars:,.2f}/contract) | "
         f"reward ${reward_dollars:,.2f} | **{setup.rr:.2f}R**",
     ]
@@ -779,7 +799,7 @@ def swings_report(symbol: str, interval: str = "5m", lookback: int | None = None
         return f"_No {lookback}-bar swings found on {spec.symbol} {interval}._"
 
     rows = [
-        [s.timestamp.strftime("%m-%d %H:%M"), s.kind.upper(), f"{s.price:,.2f}",
+        [s.timestamp.strftime("%m-%d %H:%M"), s.kind.upper(), spec.px(s.price),
          kill_zone_for(s.timestamp, config) or "—"]
         for s in found
     ]
@@ -855,7 +875,7 @@ def sensitivity(symbol: str, interval: str = "5m", sessions: int = 20,
     if frame.empty:
         return unavailable(f"{spec.symbol} {interval}", "no intraday bars")
 
-    tagged = _tag_sessions(frame)
+    tagged = _tag_sessions(frame, spec)
     all_sessions = sorted(tagged["session_date"].unique())[-sessions:]
 
     def count(overrides: dict) -> tuple[int, int, int]:
@@ -1043,7 +1063,7 @@ def rules_report(symbol: str = "NQ", interval: str = "5m", sessions: int = 20,
     if frame.empty:
         return unavailable(f"{spec.symbol} {interval}", "no intraday bars")
 
-    tagged = _tag_sessions(frame)
+    tagged = _tag_sessions(frame, spec)
     all_sessions = sorted(tagged["session_date"].unique())[-sessions:]
 
     setups: list[Setup] = []
@@ -1324,7 +1344,7 @@ def liquidity_report(symbol: str = "NQ", interval: str = "5m",
     if frame.empty:
         return unavailable(f"{spec.symbol} {interval}", "no intraday bars")
 
-    tagged = _tag_sessions(frame)
+    tagged = _tag_sessions(frame, spec)
     session_date = sorted(tagged["session_date"].unique())[-1]
     session_frame = tagged[tagged["session_date"] == session_date].sort_index()
     targets = _liquidity_targets(tagged, session_date, session_frame, spec, config)
@@ -1349,7 +1369,7 @@ def liquidity_report(symbol: str = "NQ", interval: str = "5m",
         side = "buy-side" if is_buy_side(name) else "sell-side"
         distance = price - last
         rows.append([
-            name, category(name), side, f"{price:,.2f}",
+            name, category(name), side, spec.px(price),
             f"{distance:+.2f}", f"{distance / spec.tick_points:+.0f}",
             f"${spec.points_to_dollars(abs(distance)):,.0f}",
         ])
@@ -1358,7 +1378,7 @@ def liquidity_report(symbol: str = "NQ", interval: str = "5m",
     if equals:
         eq_block = markdown_table(
             ["Kind", "Price", "Touches", "First", "Last", "Spread(t)"],
-            [[e.kind.upper(), f"{e.price:,.2f}", str(e.count), e.first_time,
+            [[e.kind.upper(), spec.px(e.price), str(e.count), e.first_time,
               e.last_time, f"{e.spread_ticks:.1f}"] for e in equals],
         )
 
@@ -1418,7 +1438,7 @@ def replay(symbol: str = "NQ", session: str | None = None, until: str = "10:15",
     if frame.empty:
         return unavailable(f"{spec.symbol} {interval}", "no intraday bars")
 
-    tagged = _tag_sessions(frame)
+    tagged = _tag_sessions(frame, spec)
     available = sorted(tagged["session_date"].unique())
     if session:
         wanted = pd.Timestamp(session, tz=EASTERN).normalize()
@@ -1452,7 +1472,7 @@ def replay(symbol: str = "NQ", session: str | None = None, until: str = "10:15",
         touched = float(visible["Low"].min()) <= price <= float(visible["High"].max())
         distance = price - last
         level_rows.append([
-            name, side, f"{price:,.2f}", f"{distance:+.1f}",
+            name, side, spec.px(price), f"{distance:+.1f}",
             f"{distance / spec.tick_points:+.0f}",
             "swept" if touched else "untouched",
         ])
@@ -1464,22 +1484,22 @@ def replay(symbol: str = "NQ", session: str | None = None, until: str = "10:15",
         bar_rows.append([
             timestamp.strftime("%H:%M"),
             "RTH" if row["is_rth"] else "ON",
-            f"{row['Open']:,.2f}", f"{row['High']:,.2f}",
-            f"{row['Low']:,.2f}", f"{row['Close']:,.2f}",
+            spec.px(row["Open"]), spec.px(row["High"]),
+            spec.px(row["Low"]), spec.px(row["Close"]),
             f"{rng / spec.tick_points:.0f}",
             f"{body / rng * 100:.0f}%" if rng else "-",
         ])
 
     recent_swings = markdown_table(
         ["Time", "Type", "Price"],
-        [[s.timestamp.strftime("%H:%M"), s.kind.upper(), f"{s.price:,.2f}"] for s in swings[-6:]],
+        [[s.timestamp.strftime("%H:%M"), s.kind.upper(), spec.px(s.price)] for s in swings[-6:]],
     ) if swings else "_None confirmed yet._"
 
     open_gaps = list(gaps[-6:])
     gap_table = markdown_table(
         ["Created", "Dir", "Bottom", "Top", "CE (entry)"],
-        [[g.timestamp.strftime("%H:%M"), g.direction, f"{g.bottom:,.2f}",
-          f"{g.top:,.2f}", f"{g.ce:,.2f}"] for g in open_gaps],
+        [[g.timestamp.strftime("%H:%M"), g.direction, spec.px(g.bottom),
+          spec.px(g.top), spec.px(g.ce)] for g in open_gaps],
     ) if open_gaps else "_None yet._"
 
     zone = kill_zone_for(visible.index[-1], config)
@@ -1488,7 +1508,7 @@ def replay(symbol: str = "NQ", session: str | None = None, until: str = "10:15",
 
 **Everything after {until} is withheld.** Make your call, then re-run with `--reveal`.
 
-Last {last:,.2f} | kill zone: {zone or "outside"} | {len(visible)} bars so far
+Last {spec.px(last)} | kill zone: {zone or "outside"} | {len(visible)} bars so far
 
 ## Step 1 - liquidity in play
 
@@ -1586,3 +1606,77 @@ bin/ta smc replay {spec.symbol} --session {session_date.date()} --until {until} 
 > - **You disagreed and the scanner was right** - the more valuable case. Which
 >   step did you skip or fudge?
 """
+
+
+# ---------------------------------------------------------------------------
+# Multi-timeframe: HTF bias feeding LTF execution
+# ---------------------------------------------------------------------------
+
+
+def load_htf_frames(spec: ContractSpec, curr_date: str | None = None,
+                    intervals: tuple[str, ...] = ("1h", "15m")) -> dict[str, pd.DataFrame]:
+    """HTF frames for bias, loaded once and reused across sessions."""
+    frames = {}
+    for interval in intervals:
+        frame = intraday(spec, interval, curr_date=curr_date)
+        if not frame.empty:
+            frames[interval] = frame
+    return frames
+
+
+def bias_at(frames: dict[str, pd.DataFrame], timestamp: pd.Timestamp,
+            config: dict) -> dict:
+    """HTF bias as of `timestamp`, using only bars that had closed by then.
+
+    The spec makes bias Step 1 and execution Steps 2-4, so the bias that gates a
+    setup has to be the one that existed when the setup formed. Computing it from
+    the completed session would be the same look-ahead the level logic already
+    guards against — the 1-hour candle that confirms the trend often closes after
+    the entry it would have authorised.
+    """
+    lookback = config["swing_lookback"]
+    readings: dict[str, str] = {}
+
+    for interval, frame in frames.items():
+        visible = frame[frame.index <= timestamp]
+        if len(visible) < 4 * lookback + 4:
+            readings[interval] = "insufficient"
+            continue
+        swings = find_swings(visible, lookback)
+        highs = [s for s in swings if s.kind == "high"][-2:]
+        lows = [s for s in swings if s.kind == "low"][-2:]
+        if len(highs) < 2 or len(lows) < 2:
+            readings[interval] = "ranging"
+            continue
+        higher_highs = highs[-1].price > highs[-2].price
+        higher_lows = lows[-1].price > lows[-2].price
+        if higher_highs and higher_lows:
+            readings[interval] = "bullish"
+        elif not higher_highs and not higher_lows:
+            readings[interval] = "bearish"
+        else:
+            readings[interval] = "ranging"
+
+    values = [v for v in readings.values() if v in ("bullish", "bearish")]
+    if values and len(set(values)) == 1 and len(values) == len([v for v in readings.values() if v != "insufficient"]):
+        bias = values[0]
+    elif values and len(set(values)) == 1:
+        bias = values[0]          # one timeframe committed, the other is ranging
+    else:
+        bias = "conflicted"
+    return {"bias": bias, "readings": readings}
+
+
+def aligned(bias: str, direction: str) -> bool:
+    """Does a setup direction agree with HTF bias?
+
+    `conflicted` and `ranging` permit both directions — the spec asks for bias to
+    be established, not for trades to be skipped when the timeframes disagree.
+    Treating a conflicted read as a veto would be a stricter strategy than the
+    one written.
+    """
+    if bias == "bullish":
+        return direction == "long"
+    if bias == "bearish":
+        return direction == "short"
+    return True

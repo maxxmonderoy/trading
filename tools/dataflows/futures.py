@@ -51,10 +51,33 @@ class ContractSpec:
     typical_spread_ticks: float
     commission_round_turn: float  # ASSUMED retail all-in; verify with your broker
     exchange: str = "CME"
+    asset_class: str = "futures"   # futures | fx
+    session_open: tuple = (18, 0)  # when the next trade date begins, exchange time
+    has_rth: bool = True           # FX trades continuously; there is no cash session
 
     @property
     def tick_value(self) -> float:
         return self.multiplier * self.tick_points
+
+    @property
+    def price_decimals(self) -> int:
+        """Digits needed to render a price without losing the tick.
+
+        NQ at 0.25 ticks needs 2; EUR/USD at 0.0001 needs 5. Printing "1.16" for
+        a pair whose whole daily range is 0.008 makes every level identical.
+        """
+        if self.tick_points >= 0.01:
+            return 2
+        if self.tick_points >= 0.0001:
+            return 5
+        return 6
+
+    def px(self, value) -> str:
+        """Format a price at this instrument's precision."""
+        try:
+            return f"{float(value):,.{self.price_decimals}f}"
+        except (TypeError, ValueError):
+            return str(value)
 
     @property
     def is_micro(self) -> bool:
@@ -103,6 +126,22 @@ def _build_specs() -> dict[str, ContractSpec]:
         built[symbol] = ContractSpec(
             symbol, data_symbol, name, multiplier, tick, spread_ticks, commission
         )
+
+    # Forex majors. `tick` is one pip (0.0001); `multiplier` is the lot size, so
+    # tick_value comes out as dollars per pip: 100k lot = $10/pip, mini = $1,
+    # micro = $0.10. Brokers quote fractional pips (0.00001) but position risk is
+    # reasoned about in pips, so the pip is the useful unit here.
+    for symbol, data_symbol, name, lot, default_commission in [
+        ("EURUSD", "EURUSD=X", "Euro / US Dollar (standard lot)", 100_000.0, 7.00),
+        ("EURUSD_MINI", "EURUSD=X", "Euro / US Dollar (mini lot)", 10_000.0, 0.70),
+        ("GBPUSD", "GBPUSD=X", "British Pound / US Dollar (standard lot)", 100_000.0, 7.00),
+        ("GBPUSD_MINI", "GBPUSD=X", "British Pound / US Dollar (mini lot)", 10_000.0, 0.70),
+    ]:
+        spread_ticks, commission = cost(symbol, default_commission)
+        built[symbol] = ContractSpec(
+            symbol, data_symbol, name, lot, 0.0001, spread_ticks, commission,
+            exchange="FX", asset_class="fx", session_open=(17, 0), has_rth=False,
+        )
     return built
 
 
@@ -112,6 +151,9 @@ SPECS: dict[str, ContractSpec] = _build_specs()
 _ALIASES = {
     "ES=F": "ES", "NQ=F": "NQ", "MES=F": "MES", "MNQ=F": "MNQ",
     "SPX": "ES", "NDX": "NQ", "SP500": "ES", "NASDAQ": "NQ",
+    "EURUSD=X": "EURUSD", "GBPUSD=X": "GBPUSD",
+    "EUR/USD": "EURUSD", "GBP/USD": "GBPUSD",
+    "EU": "EURUSD", "GU": "GBPUSD",
 }
 
 VALID_INTERVALS = {
@@ -183,21 +225,31 @@ def intraday(spec: ContractSpec, interval: str = "5m", days: int | None = None,
     return frame.sort_index()
 
 
-def _session_date(timestamp: pd.Timestamp) -> pd.Timestamp:
+def _session_date(timestamp: pd.Timestamp, spec: "ContractSpec | None" = None) -> pd.Timestamp:
     """The trade date a bar belongs to.
 
     Globex opens at 18:00 ET for the *next* trade date, so an 8pm Sunday bar is
-    Monday's session. Getting this wrong silently corrupts every overnight level.
+    Monday's session. FX rolls an hour earlier at the 17:00 ET New York close.
+    Getting this wrong silently corrupts every overnight level.
     """
-    if (timestamp.hour, timestamp.minute) >= GLOBEX_OPEN:
+    boundary = spec.session_open if spec is not None else GLOBEX_OPEN
+    if (timestamp.hour, timestamp.minute) >= boundary:
         return (timestamp + pd.Timedelta(days=1)).normalize()
     return timestamp.normalize()
 
 
-def _tag_sessions(frame: pd.DataFrame) -> pd.DataFrame:
-    """Label each bar with its trade date and whether it is RTH or overnight."""
+def _tag_sessions(frame: pd.DataFrame, spec: "ContractSpec | None" = None) -> pd.DataFrame:
+    """Label each bar with its trade date and whether it is RTH or overnight.
+
+    FX has no cash session, so every bar is marked RTH. That keeps prior-day
+    high/low meaningful — for a 24-hour instrument the whole trade date *is* the
+    session, and filtering to 09:30-16:00 would discard most of it.
+    """
     out = frame.copy()
-    out["session_date"] = [_session_date(t) for t in out.index]
+    out["session_date"] = [_session_date(t, spec) for t in out.index]
+    if spec is not None and not spec.has_rth:
+        out["is_rth"] = True
+        return out
     minutes = out.index.hour * 60 + out.index.minute
     rth_start = RTH_OPEN[0] * 60 + RTH_OPEN[1]
     rth_end = RTH_CLOSE[0] * 60 + RTH_CLOSE[1]
@@ -287,7 +339,7 @@ def levels_report(symbol: str, curr_date: str | None = None, interval: str = "5m
             f"{VALID_INTERVALS[interval]} days — a dated run older than that cannot be served",
         )
 
-    tagged = _tag_sessions(frame)
+    tagged = _tag_sessions(frame, spec)
     sessions = sorted(tagged["session_date"].unique())
     session_date = sessions[-1]
     levels = compute_levels(tagged, session_date)
@@ -311,8 +363,8 @@ def levels_report(symbol: str, curr_date: str | None = None, interval: str = "5m
             untested[key] = value
         rows.append([
             LEVEL_LABELS.get(key, key),
-            fmt_num(value),
-            f"{distance_points:+.2f}",
+            spec.px(value),
+            f"{distance_points:+.{spec.price_decimals}f}",
             f"{distance_ticks:+.0f}",
             f"${spec.points_to_dollars(abs(distance_points)):,.0f}",
             "tested" if tested else "**untested**",
@@ -331,7 +383,7 @@ def levels_report(symbol: str, curr_date: str | None = None, interval: str = "5m
         names = ", ".join(LEVEL_LABELS.get(k, k) for k, v in untested.items() if v == value)
         distance = abs(value - last_price)
         return (
-            f"{value:,.2f} ({names}) — {distance:.2f} points / "
+            f"{spec.px(value)} ({names}) — {distance:.{spec.price_decimals}f} points / "
             f"{distance / spec.tick_points:.0f} ticks away, "
             f"${spec.points_to_dollars(distance):,.0f} per {spec.symbol} contract"
         )
@@ -341,8 +393,8 @@ def levels_report(symbol: str, curr_date: str | None = None, interval: str = "5m
 
     return f"""## Session levels — {spec.symbol} ({spec.name})
 
-**Session** {session_date.date()} | **last** {last_price:,.2f} | **interval** {interval}
-**Session range so far** {session_low:,.2f} – {session_high:,.2f}
+**Session** {session_date.date()} | **last** {spec.px(last_price)} | **interval** {interval}
+**Session range so far** {spec.px(session_low)} – {spec.px(session_high)}
 ({(session_high - session_low) / spec.tick_points:.0f} ticks = ${spec.points_to_dollars(session_high - session_low):,.0f} per {spec.symbol} contract)
 
 {table}
@@ -396,7 +448,7 @@ def level_stats(symbol: str, level_key: str = "pd_high", lookback: int = 60,
     if frame.empty:
         return unavailable(f"{spec.symbol} intraday", f"no {interval} bars available")
 
-    tagged = _tag_sessions(frame)
+    tagged = _tag_sessions(frame, spec)
     sessions = sorted(tagged["session_date"].unique())[-lookback:]
     upside = level_key in _UPSIDE_LEVELS
     threshold = threshold_ticks * spec.tick_points
@@ -624,7 +676,7 @@ def position_size(symbol: str, account: float, risk_pct: float, stop_ticks: floa
     rows = [
         ["Account", f"${account:,.2f}"],
         ["Risk budget", f"{risk_pct:.2f}% = ${risk_dollars:,.2f}"],
-        ["Stop distance", f"{stop_ticks:.0f} ticks = {stop_ticks * spec.tick_points:.2f} points"],
+        ["Stop distance", f"{stop_ticks:.0f} ticks = {stop_ticks * spec.tick_points:.{spec.price_decimals}f} points"],
         ["Risk per contract", f"${risk_per_contract:,.2f}"],
         ["**Contracts permitted**", f"**{contracts}**" + (f" (unrounded {raw:.2f})" if raw >= 1 else "")],
     ]
@@ -675,7 +727,7 @@ def bars_report(symbol: str, interval: str = "5m", limit: int = 40,
             f"no {interval} bars. Intraday history is capped at {VALID_INTERVALS[interval]} days",
         )
 
-    tagged = _tag_sessions(frame).tail(limit)
+    tagged = _tag_sessions(frame, spec).tail(limit)
     rows = []
     for timestamp, row in tagged.iterrows():
         rng = float(row["High"]) - float(row["Low"])
@@ -686,8 +738,8 @@ def bars_report(symbol: str, interval: str = "5m", limit: int = 40,
         rows.append([
             timestamp.strftime("%m-%d %H:%M"),
             "RTH" if row["is_rth"] else "ON",
-            f"{row['Open']:,.2f}", f"{row['High']:,.2f}",
-            f"{row['Low']:,.2f}", f"{row['Close']:,.2f}",
+            spec.px(row["Open"]), spec.px(row["High"]),
+            spec.px(row["Low"]), spec.px(row["Close"]),
             f"{rng / spec.tick_points:.0f}",
             f"{body_pct:.0f}%",
             fmt_num(row.get("Volume"), 0),

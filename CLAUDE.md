@@ -160,6 +160,7 @@ bin/ta predictions "fed rate cut" # Polymarket implied odds
 
 # Futures (NQ/ES/MNQ/MES)
 bin/ta fut specs                  # multipliers, tick values, notional, round-trip cost
+# Instruments: NQ MNQ ES MES (futures) | EURUSD GBPUSD + _MINI (fx)
 bin/ta fut levels NQ              # session reference levels, untested liquidity
 bin/ta fut level-stats NQ --level pd_high   # measured touch/sweep/break base rates
 bin/ta fut size MNQ --account 10000 --risk-pct 1 --stop-ticks 40
@@ -167,6 +168,7 @@ bin/ta fut bars NQ --interval 5m
 
 # SMC framework (sweep -> MSS -> FVG state machine)
 bin/ta smc explain                # operational definitions and parameters
+bin/ta smc bias NQ                # Step 1: HTF bias (1H + 15M), gates LTF setups
 bin/ta smc scan NQ --sessions 20  # run the four-step state machine
 bin/ta smc rules NQ --account 10000  # with section 4 enforced and sized
 bin/ta smc sensitivity NQ         # how setup count moves with the ambiguous params
