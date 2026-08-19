@@ -169,6 +169,10 @@ bin/ta fut bars NQ --interval 5m
 # SMC framework (sweep -> MSS -> FVG state machine)
 bin/ta smc explain                # operational definitions and parameters
 bin/ta smc bias NQ                # Step 1: HTF bias (1H + 15M), gates LTF setups
+
+# Economic calendar — makes the no-news rule enforceable
+bin/ta calendar update            # scrape BLS + Fed primary sources
+bin/ta calendar show
 bin/ta smc scan NQ --sessions 20  # run the four-step state machine
 bin/ta smc rules NQ --account 10000  # with section 4 enforced and sized
 bin/ta smc sensitivity NQ         # how setup count moves with the ambiguous params

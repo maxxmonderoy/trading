@@ -1066,13 +1066,20 @@ def rules_report(symbol: str = "NQ", interval: str = "5m", sessions: int = 20,
     tagged = _tag_sessions(frame, spec)
     all_sessions = sorted(tagged["session_date"].unique())[-sessions:]
 
+    # Same HTF gate the scanner applies, so `rules` and `scan` cannot disagree
+    # about which setups exist — they differ only in what they do with them.
+    htf_frames = (
+        load_htf_frames(spec, curr_date, tuple(config.get("htf_intervals", ("1h", "15m"))))
+        if config.get("require_htf_alignment", True) else None
+    )
+
     setups: list[Setup] = []
     for session_date in all_sessions:
         session_frame = tagged[tagged["session_date"] == session_date].sort_index()
         targets = _liquidity_targets(tagged, session_date, session_frame, spec, config)
         if not targets:
             continue
-        setups.extend(scan_session(session_frame, spec, session_date, targets, config))
+        setups.extend(scan_session(session_frame, spec, session_date, targets, config, htf_frames))
 
     setups = enforce_session_rules(setups, config)
     _, calendar_error = load_news_calendar()

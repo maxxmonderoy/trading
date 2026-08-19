@@ -25,7 +25,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from dataflows import (  # noqa: E402
-    common, doctor, fundamentals, futures, macro, market, memory, news, paper, smc, social,
+    calendar, common, doctor, fundamentals, futures, macro, market, memory, news, paper,
+    smc, social,
 )
 
 
@@ -246,6 +247,17 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--interval", default="5m")
     q.add_argument("--sessions", type=int, default=20)
     _add_date(q)
+
+    # ---- economic calendar ------------------------------------------------
+    p = sub.add_parser("calendar", help="Economic calendar for the no-news rule (scraped from BLS + Fed)")
+    cal_sub = p.add_subparsers(dest="cal_command", required=True)
+
+    q = cal_sub.add_parser("update", help="Scrape primary sources and write news_calendar.json")
+    q.add_argument("--events", default="CPI,NFP,FOMC", help="Comma-separated: CPI, NFP, PPI, FOMC")
+    q.add_argument("--future-only", action="store_true", help="Drop past events from the file")
+
+    q = cal_sub.add_parser("show", help="What the blackout rule will act on")
+    q.add_argument("--limit", type=int, default=20)
 
     # ---- backtest ---------------------------------------------------------
     p = sub.add_parser("bt", help="Backtest on backtrader: run, walk-forward, null model")
@@ -522,6 +534,11 @@ def dispatch(args: argparse.Namespace) -> str:
             return smc.rules_report(args.symbol, args.interval, args.sessions, args.account, date)
         if sub == "sensitivity":
             return smc.sensitivity(args.symbol, args.interval, args.sessions, date)
+
+    if command == "calendar":
+        if args.cal_command == "update":
+            return calendar.update(tuple(e.strip().upper() for e in args.events.split(",")), args.future_only)
+        return calendar.show(args.limit)
 
     if command == "bt":
         from backtest import engine as bt_engine
