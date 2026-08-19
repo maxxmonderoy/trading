@@ -100,3 +100,54 @@ def describe(bars: pd.DataFrame, provenance: str) -> str:
         f"**Source** {provenance} | **{len(bars):,} bars** | **{sessions} sessions** | "
         f"{bars.index[0]:%Y-%m-%d} → {bars.index[-1]:%Y-%m-%d} ({span_days} days)" + warning
     )
+
+
+RESAMPLE_RULES = {"1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min", "1h": "1h"}
+
+
+def resample(bars: pd.DataFrame, interval: str) -> pd.DataFrame:
+    """Aggregate finer bars up to a coarser interval.
+
+    Buy 1-minute history once and every timeframe the framework needs is
+    derivable from it. The reverse is impossible, which is why the purchase
+    decision matters more than it looks: 5-minute data permanently forecloses
+    the 1-minute execution the spec calls for.
+
+    Bars are labelled by their opening time and closed on the left, matching how
+    every charting package and the yfinance feed already behave — get this
+    backwards and a 09:30 bar silently becomes the 09:25 bar, shifting every
+    session boundary and kill-zone edge by one bar.
+    """
+    if interval not in RESAMPLE_RULES:
+        raise ValueError(f"cannot resample to {interval!r}. Options: {', '.join(RESAMPLE_RULES)}")
+    if bars.empty:
+        return bars
+
+    out = bars.resample(RESAMPLE_RULES[interval], label="left", closed="left").agg({
+        "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum",
+    })
+    return out.dropna(subset=["open", "high", "low", "close"])
+
+
+def load_multi(symbol: str = "NQ", intervals: tuple[str, ...] = ("5m", "15m", "1h"),
+               csv: str | None = None) -> tuple[dict[str, pd.DataFrame], str]:
+    """All timeframes the framework needs, from the finest source available.
+
+    Prefers a local 1-minute file and derives the rest; falls back to fetching
+    each interval separately from yfinance, which is the only option while the
+    free source is in play.
+    """
+    base = Path(csv) if csv else DATA_DIR / f"{symbol.upper()}_1m.csv"
+    if base.exists():
+        fine = from_csv(base)
+        frames = {"1m": fine}
+        for interval in intervals:
+            frames[interval] = fine if interval == "1m" else resample(fine, interval)
+        return frames, f"csv:{base.name} (resampled)"
+
+    frames = {}
+    for interval in intervals:
+        frame, _ = load(symbol, interval)
+        if not frame.empty:
+            frames[interval] = frame
+    return frames, f"yfinance:{symbol} (per-interval)"
