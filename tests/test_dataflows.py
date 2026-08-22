@@ -322,6 +322,118 @@ class MemoryRecall(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# The EV gate
+# ---------------------------------------------------------------------------
+
+
+def _setup(outcome: str, rr: float = 2.0, risk_points: float = 20.0):
+    """A Setup carrying only the fields the EV calculation reads."""
+    from dataflows.smc import Setup
+
+    return Setup(
+        session_date="2024-01-02", direction="long", kill_zone="NY",
+        liquidity_level_name="pd_low", liquidity_level_price=0.0,
+        sweep_time="09:40", sweep_extreme=0.0, sweep_return_bars=2,
+        mss_time="09:50", mss_level=0.0, mss_close=0.0,
+        fvg_time="09:55", fvg_top=0.0, fvg_bottom=0.0,
+        entry=0.0, stop=0.0, target=0.0, target_name="pd_high",
+        risk_points=risk_points, reward_points=risk_points * rr, rr=rr,
+        risk_ticks=risk_points * 4,
+        outcome=outcome,
+    )
+
+
+class ExpectedValueGate(unittest.TestCase):
+    """A proposal must clear a measured, cost-inclusive edge — not a narrative one."""
+
+    def setUp(self):
+        from dataflows.futures import resolve
+
+        self.spec = resolve("MNQ")
+        self.config = {"ev_gate": {
+            "min_ev_r": 0.25, "min_sample": 20,
+            "adverse_ticks_entry": 2.0, "adverse_ticks_stop": 2.0,
+            "ambiguous_as_loss": True,
+        }}
+
+    def _ev(self, setups):
+        from dataflows.smc import expected_value
+
+        return expected_value(setups, self.spec, self.config)
+
+    def test_below_the_sample_floor_the_gate_fails_closed(self):
+        """An unmeasured edge is not a passing one — this is the default state."""
+        ev = self._ev([_setup("target")] * 8 + [_setup("stopped")] * 2)
+        self.assertFalse(ev["measurable"])
+        self.assertFalse(ev["passes"])
+        self.assertIsNone(ev["net_ev_r"])
+        self.assertIn("NOT MEASURABLE", ev["verdict"])
+
+    def test_a_genuine_edge_passes(self):
+        ev = self._ev([_setup("target", rr=3.0)] * 12 + [_setup("stopped")] * 12)
+        self.assertTrue(ev["measurable"])
+        self.assertTrue(ev["passes"])
+        # 0.5 x 3R - 0.5 x 1R = +1.00R gross, less a small drag.
+        self.assertAlmostEqual(ev["gross_ev_r"], 1.0, places=6)
+        self.assertLess(ev["net_ev_r"], ev["gross_ev_r"])
+
+    def test_a_coin_flip_at_2r_fails_once_costs_are_charged(self):
+        """The case the gate exists for: positive gross, negative after drag."""
+        wins, losses = 8, 22
+        ev = self._ev([_setup("target", rr=2.0)] * wins + [_setup("stopped")] * losses)
+        self.assertTrue(ev["measurable"])
+        self.assertLess(ev["gross_ev_r"], 0.25)
+        self.assertFalse(ev["passes"])
+
+    def test_costs_are_charged_and_always_reduce_ev(self):
+        setups = [_setup("target", rr=2.5)] * 15 + [_setup("stopped")] * 15
+        ev = self._ev(setups)
+        self.assertGreater(ev["mean_cost_r"], 0)
+        self.assertAlmostEqual(
+            ev["net_ev_r"], ev["gross_ev_r"] - ev["mean_cost_r"], places=9
+        )
+
+    def test_a_tighter_stop_carries_more_cost_per_r(self):
+        """Fixed dollar costs are a bigger fraction of a small risk budget."""
+        tight = self._ev([_setup("target", rr=2.0, risk_points=5.0)] * 15
+                         + [_setup("stopped", risk_points=5.0)] * 15)
+        wide = self._ev([_setup("target", rr=2.0, risk_points=50.0)] * 15
+                        + [_setup("stopped", risk_points=50.0)] * 15)
+        self.assertGreater(tight["mean_cost_r"], wide["mean_cost_r"])
+
+    def test_ambiguous_bars_count_against_the_strategy(self):
+        """OHLC cannot order a bar that spans both; assuming the win is how
+        backtests flatter themselves."""
+        setups = [_setup("target", rr=2.0)] * 15 + [_setup("stopped")] * 10 + [_setup("ambiguous")] * 5
+        strict = self._ev(setups)
+        self.assertEqual(strict["n_losses"], 15)
+        self.assertEqual(strict["n_ambiguous"], 5)
+
+        lenient_config = {"ev_gate": dict(self.config["ev_gate"], ambiguous_as_loss=False)}
+        from dataflows.smc import expected_value
+
+        lenient = expected_value(setups, self.spec, lenient_config)
+        self.assertEqual(lenient["n_losses"], 10)
+        self.assertGreater(lenient["net_ev_r"], strict["net_ev_r"])
+
+    def test_unfilled_and_open_setups_are_not_counted_as_outcomes(self):
+        setups = ([_setup("target", rr=2.0)] * 12 + [_setup("stopped")] * 12
+                  + [_setup("unfilled")] * 30 + [_setup("open_at_end")] * 10)
+        ev = self._ev(setups)
+        self.assertEqual(ev["n_resolved"], 24)
+        self.assertEqual(ev["n_unfilled"], 30)
+        self.assertEqual(ev["n_open"], 10)
+
+    def test_the_floor_is_read_from_config(self):
+        setups = [_setup("target", rr=2.0)] * 15 + [_setup("stopped")] * 15
+        strict = {"ev_gate": dict(self.config["ev_gate"], min_ev_r=0.90)}
+        from dataflows.smc import expected_value
+
+        self.assertFalse(expected_value(setups, self.spec, strict)["passes"])
+        self.assertTrue(self._ev(setups)["passes"])
+
+
+# ---------------------------------------------------------------------------
 # Formatting
 # ---------------------------------------------------------------------------
 

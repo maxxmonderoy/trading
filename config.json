@@ -38,6 +38,14 @@
         "05:00"
       ]
     },
+    "ev_gate": {
+      "_comment": "Expected-value gate. EV is measured from the scanner's own resolved setups, not from level base rates — a level's sweep frequency is not this strategy's win rate. Fails closed below min_sample: an unmeasured edge is not a passing one.",
+      "min_ev_r": 0.25,
+      "min_sample": 20,
+      "adverse_ticks_entry": 2.0,
+      "adverse_ticks_stop": 2.0,
+      "ambiguous_as_loss": true
+    },
     "eq_tolerance_ticks": 4.0,
     "session_ranges": {
       "Asia": [

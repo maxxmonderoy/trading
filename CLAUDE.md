@@ -125,13 +125,21 @@ These apply to every agent and to the orchestrator.
    before believing any of them — on the current sample, changing one
    unspecified parameter moves the setup count between 0 and 3.
 
-7. **Paper fills are simulated, and their costs are real.** Every fill takes
+7. **A setup is not an edge.** `bin/ta smc ev` measures expected value per trade
+   from the scanner's own resolved outcomes and charges spread, commission, and
+   adverse fills against it. Below `ev_gate.min_sample` it fails closed, because
+   an EV computed on eight trades describes eight trades. Two rules follow: no
+   futures proposal may be made against a FAIL or NOT MEASURABLE verdict, and a
+   level sweep rate from `fut level-stats` is never a substitute for a win rate —
+   it is the probability the trigger fires, not the probability the trade works.
+
+8. **Paper fills are simulated, and their costs are real.** Every fill takes
    slippage against you, and `paper status` reports cumulative cost drag as a share
    of total P&L. Never suppress that line to make a book look better, and always
    compare the book to benchmark buy-and-hold — active management that trails the
    index is a losing book no matter how good the write-ups read.
 
-8. **The disclaimer ships with every decision:**
+9. **The disclaimer ships with every decision:**
 
    > This is research output from an experimental multi-agent system, not
    > financial advice. LLM agents fabricate, data sources fail silently, and a
@@ -168,6 +176,7 @@ bin/ta fut bars NQ --interval 5m
 bin/ta smc explain                # operational definitions and parameters
 bin/ta smc scan NQ --sessions 20  # run the four-step state machine
 bin/ta smc rules NQ --account 10000  # with section 4 enforced and sized
+bin/ta smc ev NQ --sessions 60    # EV per trade in R, net of drag — binding gate
 bin/ta smc sensitivity NQ         # how setup count moves with the ambiguous params
 bin/ta smc swings NQ / smc fvg NQ
 bin/ta memory recall --ticker NVDA --query "..."

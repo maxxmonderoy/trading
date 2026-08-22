@@ -241,6 +241,12 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--account", type=float, default=10000.0)
     _add_date(q)
 
+    q = smc_sub.add_parser("ev", help="Expected value per trade in R, net of execution drag — the gate a proposal must clear")
+    q.add_argument("symbol", nargs="?", default="NQ")
+    q.add_argument("--interval", default="5m")
+    q.add_argument("--sessions", type=int, default=60, help="More sessions is the only way past the sample floor")
+    _add_date(q)
+
     q = smc_sub.add_parser("sensitivity", help="How the setup count moves with the ambiguous parameters")
     q.add_argument("symbol")
     q.add_argument("--interval", default="5m")
@@ -491,6 +497,8 @@ def dispatch(args: argparse.Namespace) -> str:
             return smc.replay(args.symbol, args.session, args.until, args.interval, args.reveal, args.bars, date)
         if sub == "rules":
             return smc.rules_report(args.symbol, args.interval, args.sessions, args.account, date)
+        if sub == "ev":
+            return smc.ev_report(args.symbol, args.interval, args.sessions, date)
         if sub == "sensitivity":
             return smc.sensitivity(args.symbol, args.interval, args.sessions, date)
 

@@ -1030,6 +1030,199 @@ def size_setup(setup: Setup, spec: ContractSpec, account: float, risk_pct: float
     }
 
 
+_EV_DEFAULTS = {
+    "min_ev_r": 0.25,
+    "min_sample": 20,
+    "adverse_ticks_entry": 2.0,
+    "adverse_ticks_stop": 2.0,
+    "ambiguous_as_loss": True,
+}
+
+
+def ev_settings(config: dict | None = None) -> dict:
+    settings = dict(_EV_DEFAULTS)
+    settings.update((config or smc_config()).get("ev_gate", {}))
+    return settings
+
+
+def expected_value(setups: list[Setup], spec: ContractSpec, config: dict | None = None) -> dict:
+    """Measured expected value per trade, in R, net of execution drag.
+
+        EV_R = p_win × mean_R_win − p_loss × 1.0 − cost_R
+
+    Three things about where the inputs come from, because getting them from the
+    wrong place is the usual way an EV gate ends up rubber-stamping a losing
+    strategy:
+
+    **The win rate is this strategy's, not a level's.** `fut level-stats` measures
+    how often a level is swept or broken. That is the probability of the *setup
+    trigger*, not of the *trade working* — conditioning on a sweep is step 2 of
+    four, and the MSS and FVG steps that follow filter the population heavily. The
+    scanner already resolves every setup it produces to `target` or `stopped`, so
+    that resolved population is the only honest source for p_win.
+
+    **A loss is 1R by construction, a win is not.** Every setup is sized so the
+    stop is exactly 1R, but targets are drawn to liquidity, so `rr` varies per
+    setup. Winners are therefore averaged, losers are not.
+
+    **Costs are charged in R, per setup.** A fixed dollar cost is a different
+    fraction of risk for a 20-tick stop than for an 80-tick one, so the drag is
+    computed per setup and then averaged, never applied as a single blended
+    number at the end.
+
+    `ambiguous` outcomes — where one bar spans both stop and target and OHLC
+    cannot order them — count as losses by default. That is the conservative
+    reading, and it is the one that matches the scanner's refusal to assume the
+    favourable fill.
+    """
+    settings = ev_settings(config)
+    wins = [s for s in setups if s.outcome == "target"]
+    losses = [s for s in setups if s.outcome == "stopped"]
+    ambiguous = [s for s in setups if s.outcome == "ambiguous"]
+    if settings["ambiguous_as_loss"]:
+        losses = losses + ambiguous
+
+    resolved = wins + losses
+    n = len(resolved)
+
+    cost_r_values = []
+    for setup in resolved:
+        risk_dollars = spec.points_to_dollars(setup.risk_points)
+        if risk_dollars <= 0:
+            continue
+        slippage_ticks = settings["adverse_ticks_entry"] + settings["adverse_ticks_stop"]
+        drag = spec.round_trip_cost() + spec.ticks_to_dollars(slippage_ticks)
+        cost_r_values.append(drag / risk_dollars)
+    mean_cost_r = sum(cost_r_values) / len(cost_r_values) if cost_r_values else 0.0
+
+    result = {
+        "n_resolved": n,
+        "n_wins": len(wins),
+        "n_losses": len(losses),
+        "n_ambiguous": len(ambiguous),
+        "n_unfilled": len([s for s in setups if s.outcome == "unfilled"]),
+        "n_open": len([s for s in setups if s.outcome == "open_at_end"]),
+        "min_sample": settings["min_sample"],
+        "min_ev_r": settings["min_ev_r"],
+        "mean_cost_r": mean_cost_r,
+        "slippage_ticks": settings["adverse_ticks_entry"] + settings["adverse_ticks_stop"],
+    }
+
+    if n < settings["min_sample"]:
+        # Fails closed. An EV computed on eight trades is a description of eight
+        # trades; quoting it as an edge is how a strategy gets sized off noise.
+        result.update({
+            "measurable": False, "passes": False,
+            "p_win": None, "mean_r_win": None, "gross_ev_r": None, "net_ev_r": None,
+            "verdict": (
+                f"NOT MEASURABLE — {n} resolved setups, {settings['min_sample']} required. "
+                "The gate fails closed: an unmeasured edge is not a passing one."
+            ),
+        })
+        return result
+
+    p_win = len(wins) / n
+    mean_r_win = sum(s.rr for s in wins) / len(wins) if wins else 0.0
+    gross_ev_r = p_win * mean_r_win - (1 - p_win) * 1.0
+    net_ev_r = gross_ev_r - mean_cost_r
+    passes = net_ev_r >= settings["min_ev_r"]
+
+    result.update({
+        "measurable": True,
+        "passes": passes,
+        "p_win": p_win,
+        "mean_r_win": mean_r_win,
+        "gross_ev_r": gross_ev_r,
+        "net_ev_r": net_ev_r,
+        "verdict": (
+            f"{'PASS' if passes else 'FAIL'} — net EV {net_ev_r:+.3f}R per trade against a "
+            f"{settings['min_ev_r']:+.2f}R floor."
+        ),
+    })
+    return result
+
+
+def _ev_block(ev: dict, spec: ContractSpec) -> str:
+    """The EV gate rendered for an agent that must not trade past a FAIL."""
+    header = "### Expected-value gate\n"
+    if not ev["measurable"]:
+        return (
+            f"{header}\n> 🚫 **{ev['verdict']}**\n>\n"
+            f"> Resolved: {ev['n_wins']} target, {ev['n_losses']} stopped "
+            f"({ev['n_ambiguous']} ambiguous counted as losses), "
+            f"{ev['n_unfilled']} never filled, {ev['n_open']} still open.\n>\n"
+            "> Widen `--sessions`, or accept that this configuration has no measured edge "
+            "yet. Do not size a position against an EV this thin.\n"
+        )
+
+    marker = "✅" if ev["passes"] else "🚫"
+    table = markdown_table(["Term", "Value"], [
+        ["Resolved setups", str(ev["n_resolved"])],
+        ["Win rate", f"{ev['p_win'] * 100:.1f}% ({ev['n_wins']}/{ev['n_resolved']})"],
+        ["Mean winner", f"{ev['mean_r_win']:.2f}R"],
+        ["Mean loser", "1.00R (stop is 1R by construction)"],
+        ["Gross EV", f"{ev['gross_ev_r']:+.3f}R"],
+        ["Execution drag", f"−{ev['mean_cost_r']:.3f}R "
+                           f"(round turn + {ev['slippage_ticks']:.0f} ticks adverse)"],
+        ["**Net EV**", f"**{ev['net_ev_r']:+.3f}R**"],
+        ["Floor", f"{ev['min_ev_r']:+.2f}R"],
+    ])
+    if ev["passes"]:
+        note = ""
+    elif ev["net_ev_r"] < 0:
+        note = (
+            "\n> **Do not propose a trade from this configuration.** Net of costs it loses "
+            f"{abs(ev['net_ev_r']):.3f}R per trade on the measured sample.\n"
+        )
+    else:
+        note = (
+            "\n> **Do not propose a trade from this configuration.** The edge is real but too "
+            f"thin to survive: {ev['net_ev_r']:+.3f}R against a {ev['min_ev_r']:+.2f}R floor, and "
+            f"execution drag alone is {ev['mean_cost_r']:.3f}R. A sample this size moves several "
+            "points per trade.\n"
+        )
+    return (
+        f"{header}\n{marker} **{ev['verdict']}**\n\n{table}\n{note}\n"
+        f"_Win rate is measured from this scanner's own resolved setups. It is not a level "
+        f"sweep rate — `fut level-stats` measures whether a level gets taken, which is the "
+        f"trigger, not the trade._\n"
+    )
+
+
+def ev_report(symbol: str = "NQ", interval: str = "5m", sessions: int = 60,
+              curr_date: str | None = None) -> str:
+    """Standalone EV gate over a window of sessions."""
+    try:
+        spec = resolve(symbol)
+    except ValueError as exc:
+        return f"<error: {exc}>"
+
+    config = smc_config()
+    frame = intraday(spec, interval, curr_date=curr_date)
+    if frame.empty:
+        return unavailable(f"{spec.symbol} {interval}", "no intraday bars")
+
+    tagged = _tag_sessions(frame)
+    setups: list[Setup] = []
+    for session_date in sorted(tagged["session_date"].unique())[-sessions:]:
+        session_frame = tagged[tagged["session_date"] == session_date].sort_index()
+        targets = _liquidity_targets(tagged, session_date, session_frame, spec, config)
+        if not targets:
+            continue
+        setups.extend(scan_session(session_frame, spec, session_date, targets, config))
+
+    setups = enforce_session_rules(setups, config)
+    ev = expected_value(setups, spec, config)
+    return (
+        f"## Expected value — {spec.symbol} {interval}, last {sessions} sessions\n\n"
+        f"{_ev_block(ev, spec)}\n"
+        f"_Costs: {spec.typical_spread_ticks:.0f}-tick spread + "
+        f"${spec.commission_round_turn:,.2f} commission per round turn, from "
+        f"`config.json: futures.costs`. Replace those with your broker's actual fills — "
+        f"every number above moves with them._\n"
+    )
+
+
 def rules_report(symbol: str = "NQ", interval: str = "5m", sessions: int = 20,
                  account: float = 10000.0, curr_date: str | None = None) -> str:
     """Scan with section 4 enforced, and size every setup against a real account."""
@@ -1087,10 +1280,20 @@ def rules_report(symbol: str = "NQ", interval: str = "5m", sessions: int = 20,
             "which is the rule that makes the rest survivable."
         )
 
+    ev = expected_value(setups, spec, config)
+    if not ev["passes"]:
+        notes.insert(0, (
+            "> 🚫 **EV GATE FAILED — no trade may be proposed from this configuration.** "
+            f"{ev['verdict']} The sizing table below is what the rules *would* permit; it is "
+            "not a licence to take them."
+        ))
+
     return f"""## SMC with hard rules enforced — {spec.symbol} {interval}, ${account:,.0f} account
 
 Risk {config['risk_pct']:.0f}% per trade | max {config['max_trades_per_session']} trades/session |
 shutdown after {config['stop_after_losses']} losses | news blackout ±{config['news_blackout_minutes']}min
+
+{_ev_block(ev, spec)}
 
 {markdown_table(["Session", "Zone", "Dir", "Risk(t)", "$/contract", "Contracts", "Actual risk", "R:R", "Outcome"], rows) if rows else "_No setups._"}
 

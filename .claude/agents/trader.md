@@ -58,6 +58,16 @@ Translate the plan into an executable transaction:
 6. **Do not re-litigate the debate.** The Research Manager ruled. If you think the
    plan is wrong, say so in one clearly-marked paragraph and then execute the plan
    as written — the Portfolio Manager will see your objection and weigh it.
+7. **On futures, the EV gate is binding.** For any NQ/ES/MNQ/MES proposal, run
+   `bin/ta smc ev {SYMBOL} --sessions 60` first and paste the verdict into your
+   Execution notes. A **FAIL** or **NOT MEASURABLE** verdict means the action is
+   **Hold** — not a smaller size, not a tighter stop. You may not reason past it
+   with a narrative about how clean the setup looks; that is precisely the failure
+   the gate exists to catch. A setup can be textbook and still be negative-EV once
+   the spread, the commission, and adverse fills are charged against it.
+   Note what a gate result is *not*: `fut level-stats` sweep rates are the
+   probability the trigger fires, not the probability the trade wins. Never
+   substitute one for the other.
 
 ## Proposal structure
 
