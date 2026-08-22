@@ -921,6 +921,79 @@ class BinanceLoader(unittest.TestCase):
         self.assertEqual(float(frame["low"].iloc[0]), 41900.0)
 
 
+class SweepProbe(unittest.TestCase):
+    """Step 2 of hypothesis testing: does the sweep alone carry the edge?
+
+    If the raw sweep is negative-EV before costs, filters are selecting from a
+    losing population and the hypothesis is dead. The probe exists so that gets
+    answered before anyone builds a state machine on top of it.
+    """
+
+    def setUp(self):
+        from dataflows import smc
+
+        self.smc = smc
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _write(self, bars):
+        """bars: (iso_timestamp, open, high, low, close)."""
+        lines = ["timestamp,open,high,low,close,volume"]
+        lines += [f"{t},{o},{h},{l},{c},100" for t, o, h, l, c in bars]
+        path = self.dir / "bars.csv"
+        path.write_text("\n".join(lines) + "\n")
+        return str(path)
+
+    def _two_sessions(self, second_day):
+        """Day one sets PDH at 110; day two is supplied by the caller."""
+        day1 = [(f"2024-01-02 {h:02d}:{m:02d}:00", 100, 110, 90, 100)
+                for h in range(10, 12) for m in (0, 30)]
+        return self._write(day1 + second_day)
+
+    def test_an_unswept_level_yields_no_trades(self):
+        quiet = [(f"2024-01-03 {h:02d}:{m:02d}:00", 100, 105, 95, 100)
+                 for h in range(10, 12) for m in (0, 30)]
+        out = self.smc.probe("NQ", self._two_sessions(quiet), "pd_high")
+        self.assertIn("No sweeps found", out)
+
+    def test_a_gap_beyond_the_level_is_excluded_not_counted_as_a_sweep(self):
+        """The session never traded into the resting orders."""
+        gapped = [(f"2024-01-03 {h:02d}:{m:02d}:00", 130, 135, 125, 130)
+                  for h in range(10, 12) for m in (0, 30)]
+        out = self.smc.probe("NQ", self._two_sessions(gapped), "pd_high")
+        self.assertIn("gapped beyond", out)
+
+    def test_every_requested_target_is_reported(self):
+        swept = [("2024-01-03 10:00:00", 100, 112, 99, 105),
+                 ("2024-01-03 10:30:00", 105, 106, 80, 82),
+                 ("2024-01-03 11:00:00", 82, 84, 70, 72)]
+        out = self.smc.probe("NQ", self._two_sessions(swept), "pd_high",
+                             targets="1.0,2.0,3.0")
+        for label in ("1.0R", "2.0R", "3.0R"):
+            self.assertIn(label, out)
+
+    def test_an_unknown_level_is_rejected(self):
+        self.assertIn("unknown level", self.smc.probe("NQ", "x.csv", "rth_vwap"))
+
+    def test_a_wider_stop_lowers_cost_per_r(self):
+        """Fixed costs are a smaller share of a bigger risk budget."""
+        swept = [("2024-01-03 10:00:00", 100, 112, 99, 105),
+                 ("2024-01-03 10:30:00", 105, 106, 80, 82),
+                 ("2024-01-03 11:00:00", 82, 84, 70, 72)]
+        path = self._two_sessions(swept)
+        tight = self.smc.probe("NQ", path, "pd_high", stop_ticks=4)
+        wide = self.smc.probe("NQ", path, "pd_high", stop_ticks=40)
+
+        def cost_of(text):
+            import re as _re
+            return float(_re.search(r"−(\d+\.\d+)R", text).group(1))
+
+        self.assertGreater(cost_of(tight), cost_of(wide))
+
+
 class SampleProjection(unittest.TestCase):
     """Answering "when will I know if this works" with a session count."""
 

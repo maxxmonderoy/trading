@@ -173,20 +173,34 @@ These apply to every agent and to the orchestrator.
    about this state machine on crypto. What transfers to NQ is the mechanism;
    the liquidity structure does not.
 
-9. **A scaled exit is not a win, and the EV must not pretend otherwise.** With
+9. **Test the feature before the machine.** `bin/ta smc probe` measures one
+   sweep with no structure confirmation and no gap entry, at several R targets
+   at once. It answers the question the four-step scanner cannot: is the edge in
+   the sweep, or in the MSS and FVG filters? If the raw sweep is negative before
+   costs, the hypothesis is dead — filters select from that population, they do
+   not improve it. A row positive at 1R and negative at 2R is a mean-reversion
+   trade wearing a continuation target.
+
+   **Cost drag scales inversely with stop size, and this cuts against tight
+   stops.** A fixed round turn is a fixed dollar amount, so a 10-tick NQ stop
+   surrenders 0.48R to costs where an 80-tick stop surrenders 0.06R. Any
+   proposal for tight stops as "negative asymmetry harvesting" has to clear that
+   first: the asymmetry is real, and so is the drag that eats it.
+
+10. **A scaled exit is not a win, and the EV must not pretend otherwise.** With
    `smc.scaling` on, a trade that banks half at 1R and stops its runner at
    breakeven returns about +0.5R. That is neither a win nor a loss, so outcomes
    carry `realized_r` and EV is the mean of it. Decomposing into a win rate and
    an average winner is wrong once partial exits put mass between −1R and the
    target; the win rate survives only as a description.
 
-10. **Paper fills are simulated, and their costs are real.** Every fill takes
+11. **Paper fills are simulated, and their costs are real.** Every fill takes
    slippage against you, and `paper status` reports cumulative cost drag as a share
    of total P&L. Never suppress that line to make a book look better, and always
    compare the book to benchmark buy-and-hold — active management that trails the
    index is a losing book no matter how good the write-ups read.
 
-11. **The disclaimer ships with every decision:**
+12. **The disclaimer ships with every decision:**
 
    > This is research output from an experimental multi-agent system, not
    > financial advice. LLM agents fabricate, data sources fail silently, and a
@@ -223,6 +237,7 @@ bin/ta fut bars NQ --interval 5m
 bin/ta smc explain                # operational definitions and parameters
 bin/ta smc scan NQ --sessions 20  # run the four-step state machine
 bin/ta smc rules NQ --account 10000  # with section 4 enforced and sized
+bin/ta smc probe NQ --csv nq.csv --level pd_high   # raw base rate for ONE sweep
 bin/ta smc ev NQ --sessions 60    # EV per trade in R, net of drag — binding gate
 bin/ta smc journal record NQ      # accumulate resolved setups — run daily
 bin/ta smc journal backfill NQ --csv nq_5m.csv   # scan local history into the journal

@@ -1766,6 +1766,173 @@ def backfill_journal(symbol: str, csv_path: str, interval: str = "5m",
     )
 
 
+_PROBE_LEVELS = {
+    "pd_high": ("PDH", "short"), "pd_low": ("PDL", "long"),
+    "on_high": ("ONH", "short"), "on_low": ("ONL", "long"),
+}
+
+
+def probe(symbol: str, csv_path: str, level_key: str = "pd_high",
+          targets: str = "1.0,1.5,2.0", stop_ticks: float = 0.0,
+          killzone: str = "any", tz: str = EASTERN) -> str:
+    """Raw base rate for ONE sweep, before any state machine is layered on.
+
+    The four-step scanner answers "does sweep → MSS → FVG work". It cannot
+    answer "does the sweep carry the edge, or is it the MSS and FVG filters
+    doing the work" — and if the sweep alone is negative-EV before costs, the
+    filters are selecting from a losing population and the hypothesis should be
+    discarded rather than refined.
+
+    So this measures the crudest possible version: enter on the close of the bar
+    that sweeps the level, stop beyond the sweep extreme, exit at fixed R
+    multiples. No structure confirmation, no gap entry, no discretion. Whatever
+    edge shows up here is attributable to the sweep itself.
+
+    Reporting several targets at once is deliberate. A setup that is positive at
+    1R and negative at 2R is a mean-reversion trade being mislabelled as a
+    continuation trade, and one number would hide that.
+    """
+    try:
+        spec = resolve(symbol)
+    except ValueError as exc:
+        return f"<error: {exc}>"
+    if level_key not in _PROBE_LEVELS:
+        return f"<error: unknown level {level_key!r}. Options: {', '.join(_PROBE_LEVELS)}>"
+
+    try:
+        frame = load_ohlcv_csv(csv_path, tz)
+    except (OSError, ValueError) as exc:
+        return f"<error: {type(exc).__name__}: {exc}>"
+
+    config = smc_config()
+    label, direction = _PROBE_LEVELS[level_key]
+    short = direction == "short"
+    sign = -1.0 if short else 1.0
+    target_rs = [float(t) for t in targets.split(",") if t.strip()]
+
+    tagged = _tag_sessions(frame, spec)
+    sessions = sorted(tagged["session_date"].unique())
+
+    trades = []
+    swept_sessions = gapped = no_level = 0
+
+    for session_date in sessions:
+        levels = compute_levels(tagged, session_date)
+        level = levels.get(level_key)
+        if level is None:
+            no_level += 1
+            continue
+        session = tagged[tagged["session_date"] == session_date].sort_index()
+        if spec.session_model == "globex":
+            session = session[session["is_rth"]]
+        if session.empty:
+            continue
+
+        highs = session["High"].astype(float).to_numpy()
+        lows = session["Low"].astype(float).to_numpy()
+        closes = session["Close"].astype(float).to_numpy()
+
+        # A session that opens beyond the level never traded into the resting
+        # orders — there is no sweep event to measure.
+        if (short and closes[0] > level) or (not short and closes[0] < level):
+            gapped += 1
+            continue
+
+        pierce = None
+        for i in range(len(session)):
+            if killzone != "any" and kill_zone_for(session.index[i], config) != killzone:
+                continue
+            if (short and highs[i] > level) or (not short and lows[i] < level):
+                pierce = i
+                break
+        if pierce is None:
+            continue
+        swept_sessions += 1
+
+        entry = closes[pierce]
+        extreme = highs[pierce] if short else lows[pierce]
+        if stop_ticks > 0:
+            stop = entry - sign * stop_ticks * spec.tick_points
+        else:
+            buffer = config["stop_buffer_ticks"] * spec.tick_points
+            stop = extreme + (buffer if short else -buffer)
+        risk_points = abs(entry - stop)
+        if risk_points <= 0:
+            continue
+
+        # Forward walk once; record which R multiples were reached before the stop.
+        reached = {r: False for r in target_rs}
+        stopped_at = None
+        for j in range(pierce + 1, len(session)):
+            if stopped_at is None:
+                hit_stop = highs[j] >= stop if short else lows[j] <= stop
+                if hit_stop:
+                    stopped_at = j
+            for r in target_rs:
+                if reached[r]:
+                    continue
+                price = entry + sign * r * risk_points
+                hit = lows[j] <= price if short else highs[j] >= price
+                if hit and stopped_at is None:
+                    reached[r] = True
+                elif hit and stopped_at == j:
+                    reached[r] = False  # same bar as the stop: unorderable, refuse it
+            if stopped_at is not None:
+                break
+
+        trades.append({
+            "session": str(session_date.date()), "entry": entry,
+            "risk_points": risk_points, "reached": reached,
+        })
+
+    if not trades:
+        return (
+            f"## Sweep probe — {spec.symbol} {label}\n\n"
+            f"No sweeps found across {len(sessions)} sessions "
+            f"({gapped} gapped beyond the level at the open, {no_level} had no level).\n"
+        )
+
+    rows = []
+    for r in target_rs:
+        wins = sum(1 for t in trades if t["reached"][r])
+        n = len(trades)
+        win_rate = wins / n
+        gross = win_rate * r - (1 - win_rate) * 1.0
+        costs = []
+        for t in trades:
+            risk_dollars = spec.points_to_dollars(t["risk_points"])
+            drag = spec.round_trip_cost(t["entry"]) + spec.ticks_to_dollars(3.0)
+            costs.append(drag / risk_dollars if risk_dollars else 0.0)
+        cost_r = sum(costs) / len(costs)
+        net = gross - cost_r
+        rows.append([
+            f"{r:.1f}R", f"{wins}/{n}", f"{win_rate * 100:.1f}%",
+            f"{gross:+.3f}R", f"−{cost_r:.3f}R", f"**{net:+.3f}R**",
+            "keep" if net > 0.05 else "discard",
+        ])
+
+    median_risk = sorted(t["risk_points"] for t in trades)[len(trades) // 2]
+    return f"""## Sweep probe — {spec.symbol} {label}, {len(sessions)} sessions
+
+Entry on the close of the bar that first pierces {label}\
+{f" during the {killzone} kill zone" if killzone != "any" else ""}. \
+Stop {'at a fixed ' + str(stop_ticks) + ' ticks' if stop_ticks else 'beyond the sweep extreme'}. \
+No structure confirmation, no gap entry — whatever edge appears here belongs to the sweep alone.
+
+{markdown_table(
+    ["Target", "Hits", "Win rate", "Gross EV", "Cost", "Net EV", "Verdict"], rows
+)}
+
+**{len(trades)} sweeps** in {swept_sessions} sessions | {gapped} sessions gapped beyond at the open |
+median risk {median_risk:.2f} points (${spec.points_to_dollars(median_risk):,.0f})
+
+> A row that is positive at 1R and negative at 2R is a mean-reversion trade, not
+> a continuation trade — the target, not the entry, is what is wrong. If every
+> row is negative before costs, the hypothesis is dead and no filter will revive
+> it: filters select from this population, they do not improve it.
+"""
+
+
 def journal_status(symbol: str = "") -> str:
     """What the journal holds, segmented by the parameters that produced it."""
     rows = load_journal(symbol)

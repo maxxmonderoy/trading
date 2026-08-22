@@ -253,6 +253,15 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--account", type=float, default=10000.0)
     _add_date(q)
 
+    q = smc_sub.add_parser("probe", help="Raw base rate for ONE sweep, before any state machine — step 2 of hypothesis testing")
+    q.add_argument("symbol")
+    q.add_argument("--csv", required=True, help="Local intraday OHLCV history")
+    q.add_argument("--level", default="pd_high", help="pd_high, pd_low, on_high, on_low")
+    q.add_argument("--targets", default="1.0,1.5,2.0", help="R multiples to measure, comma separated")
+    q.add_argument("--stop-ticks", type=float, default=0.0, help="Fixed stop; default is structural (beyond the sweep extreme)")
+    q.add_argument("--killzone", default="any", help="NY, London, or any")
+    q.add_argument("--tz", default="America/New_York")
+
     q = smc_sub.add_parser("ev", help="Expected value per trade in R, net of execution drag — the gate a proposal must clear")
     q.add_argument("symbol", nargs="?", default="NQ")
     q.add_argument("--interval", default="5m")
@@ -540,6 +549,9 @@ def dispatch(args: argparse.Namespace) -> str:
             return smc.replay(args.symbol, args.session, args.until, args.interval, args.reveal, args.bars, date)
         if sub == "rules":
             return smc.rules_report(args.symbol, args.interval, args.sessions, args.account, date)
+        if sub == "probe":
+            return smc.probe(args.symbol, args.csv, args.level, args.targets,
+                             args.stop_ticks, args.killzone, args.tz)
         if sub == "ev":
             return smc.ev_report(args.symbol, args.interval, args.sessions, date, args.journal)
         if sub == "journal":
