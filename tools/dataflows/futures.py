@@ -127,6 +127,10 @@ def _build_specs() -> dict[str, ContractSpec]:
         ("MES", "ES=F", "Micro E-mini S&P 500", 5.0, 0.25, 1.40),
         ("NQ", "NQ=F", "E-mini Nasdaq-100", 20.0, 0.25, 4.00),
         ("MNQ", "NQ=F", "Micro E-mini Nasdaq-100", 2.0, 0.25, 1.40),
+        # Eurex. Same session-based structure as the CME index products, traded
+        # on a European clock; yfinance does not serve it, so it is reachable
+        # only through a local history file.
+        ("FESX", "FESX", "EURO STOXX 50 (Eurex)", 10.0, 1.0, 2.00),
     ]:
         spread_ticks, commission = cost(symbol, default_commission)
         built[symbol] = ContractSpec(
