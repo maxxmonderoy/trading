@@ -261,6 +261,17 @@ def build_parser() -> argparse.ArgumentParser:
     r = journal_sub.add_parser("status", help="What the journal holds, by parameter set")
     r.add_argument("symbol", nargs="?", default="")
 
+    r = journal_sub.add_parser(
+        "backfill",
+        help="Scan a local OHLCV CSV and journal it — the only route to a measurable EV without waiting months",
+    )
+    r.add_argument("symbol")
+    r.add_argument("--csv", required=True, help="Intraday OHLCV file: timestamp + open/high/low/close[/volume]")
+    r.add_argument("--interval", default="5m", help="Bar size in the file (must match the data)")
+    r.add_argument("--tz", default="America/New_York",
+                   help="Timezone of naive timestamps. Wrong value corrupts every session boundary.")
+    r.add_argument("--dry-run", action="store_true", help="Audit and preview the EV without writing")
+
     q = smc_sub.add_parser("sensitivity", help="How the setup count moves with the ambiguous parameters")
     q.add_argument("symbol")
     q.add_argument("--interval", default="5m")
@@ -516,6 +527,10 @@ def dispatch(args: argparse.Namespace) -> str:
         if sub == "journal":
             if args.journal_command == "record":
                 return smc.record_journal(args.symbol, args.interval, args.sessions, date)
+            if args.journal_command == "backfill":
+                return smc.backfill_journal(
+                    args.symbol, args.csv, args.interval, args.tz, args.dry_run
+                )
             return smc.journal_status(args.symbol)
         if sub == "sensitivity":
             return smc.sensitivity(args.symbol, args.interval, args.sessions, date)

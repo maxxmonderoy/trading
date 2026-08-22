@@ -541,6 +541,118 @@ class SetupJournal(unittest.TestCase):
         self.assertIn("smc journal record", self.smc.journal_status())
 
 
+class BackfillLoader(unittest.TestCase):
+    """Reading a local history file — the route to a sample that does not take years.
+
+    The timezone branch is the dangerous part: this framework tags sessions on
+    the 18:00 ET Globex boundary, so a file read an hour off silently reassigns
+    bars to the wrong trade date and corrupts every overnight level.
+    """
+
+    def setUp(self):
+        from dataflows import smc
+
+        self.smc = smc
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _csv(self, text, name="bars.csv"):
+        path = self.dir / name
+        path.write_text(text)
+        return str(path)
+
+    def test_naive_timestamps_are_localised_to_the_given_zone(self):
+        path = self._csv(
+            "timestamp,open,high,low,close,volume\n"
+            "2024-01-02 09:30:00,100,101,99,100.5,10\n"
+            "2024-01-02 09:35:00,100.5,102,100,101,12\n"
+        )
+        frame = self.smc.load_ohlcv_csv(path, "America/New_York")
+        self.assertEqual(str(frame.index[0]), "2024-01-02 09:30:00-05:00")
+
+    def test_offset_aware_timestamps_survive_a_dst_change(self):
+        """Two offsets in one file is what breaks a naive parse."""
+        path = self._csv(
+            "timestamp,open,high,low,close\n"
+            "2024-01-02 09:30:00-05:00,100,101,99,100.5\n"
+            "2024-07-02 09:30:00-04:00,100.5,102,100,101\n"
+        )
+        frame = self.smc.load_ohlcv_csv(path)
+        self.assertEqual(len(frame), 2)
+        self.assertEqual([t.hour for t in frame.index], [9, 9])
+
+    def test_column_aliases_are_accepted(self):
+        path = self._csv(
+            "Date,O,H,L,C,Vol\n2024-01-02 09:30:00,100,101,99,100.5,10\n"
+        )
+        frame = self.smc.load_ohlcv_csv(path, "America/New_York")
+        self.assertEqual(list(frame.columns), ["Open", "High", "Low", "Close", "Volume"])
+
+    def test_missing_volume_defaults_rather_than_failing(self):
+        path = self._csv(
+            "timestamp,open,high,low,close\n2024-01-02 09:30:00,100,101,99,100.5\n"
+        )
+        self.assertEqual(self.smc.load_ohlcv_csv(path, "America/New_York")["Volume"].iloc[0], 0.0)
+
+    def test_a_missing_price_column_is_a_hard_error(self):
+        path = self._csv("timestamp,open,high,close\n2024-01-02 09:30:00,100,101,100.5\n")
+        with self.assertRaises(ValueError) as caught:
+            self.smc.load_ohlcv_csv(path, "America/New_York")
+        self.assertIn("Low", str(caught.exception))
+
+    def test_a_missing_timestamp_column_names_what_it_looked_for(self):
+        path = self._csv("open,high,low,close\n100,101,99,100.5\n")
+        with self.assertRaises(ValueError) as caught:
+            self.smc.load_ohlcv_csv(path, "America/New_York")
+        self.assertIn("timestamp", str(caught.exception))
+
+    def test_duplicate_timestamps_are_collapsed(self):
+        path = self._csv(
+            "timestamp,open,high,low,close\n"
+            "2024-01-02 09:30:00,100,101,99,100.5\n"
+            "2024-01-02 09:30:00,100,101,99,100.5\n"
+        )
+        self.assertEqual(len(self.smc.load_ohlcv_csv(path, "America/New_York")), 1)
+
+    def test_rows_are_sorted_even_when_the_file_is_not(self):
+        path = self._csv(
+            "timestamp,open,high,low,close\n"
+            "2024-01-02 09:35:00,100.5,102,100,101\n"
+            "2024-01-02 09:30:00,100,101,99,100.5\n"
+        )
+        frame = self.smc.load_ohlcv_csv(path, "America/New_York")
+        self.assertTrue(frame.index.is_monotonic_increasing)
+
+
+class SampleProjection(unittest.TestCase):
+    """Answering "when will I know if this works" with a session count."""
+
+    def setUp(self):
+        from dataflows import smc
+
+        self.project = smc.sample_projection
+
+    def test_it_reports_how_many_more_sessions_are_needed(self):
+        out = self.project(sessions_scanned=100, resolved=5, min_sample=20)
+        self.assertIn("0.050 resolved setups per session", out)
+        self.assertIn("300 further sessions", out)
+
+    def test_a_zero_rate_says_the_gate_never_opens(self):
+        out = self.project(sessions_scanned=200, resolved=0, min_sample=20)
+        self.assertIn("never opens", out)
+        self.assertIn("sensitivity", out)
+
+    def test_reaching_the_floor_says_so(self):
+        out = self.project(sessions_scanned=100, resolved=25, min_sample=20)
+        self.assertIn("floor reached", out)
+
+    def test_no_sessions_produces_no_claim(self):
+        self.assertEqual(self.project(0, 0, 20), "")
+
+
 # ---------------------------------------------------------------------------
 # Formatting
 # ---------------------------------------------------------------------------

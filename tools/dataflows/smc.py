@@ -31,6 +31,7 @@ Resolved definitions:
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from datetime import time as dtime
@@ -1359,6 +1360,269 @@ def record_journal(symbol: str = "NQ", interval: str = "5m", sessions: int = 30,
            if remaining else f"Sample floor reached — `bin/ta smc ev {spec.symbol} --journal` is now measurable.\n")
         + f"\n_Run this daily. The vendor serves only {VALID_INTERVALS.get(interval, '?')} "
         f"days of {interval} bars, so the journal is the only way the sample grows._\n"
+    )
+
+
+_TIMESTAMP_NAMES = ("timestamp", "datetime", "date", "time", "date_time", "开始时间")
+_OHLCV_NAMES = {
+    "Open": ("open", "o"), "High": ("high", "h"), "Low": ("low", "l"),
+    "Close": ("close", "c", "last"), "Volume": ("volume", "vol", "v"),
+}
+
+
+def load_ohlcv_csv(path: str, tz: str = EASTERN) -> pd.DataFrame:
+    """Read a local intraday CSV into the frame shape the scanner expects.
+
+    Column names vary by vendor, so they are matched case-insensitively against
+    a small set of aliases rather than required verbatim. What is *not* flexible
+    is the timezone: this framework session-tags on the 18:00 ET Globex boundary,
+    so a file read an hour off silently reassigns bars to the wrong trade date
+    and corrupts every overnight level. If the file carries no offset, `tz` says
+    what it is, and getting that wrong is the most likely way to ruin a backfill.
+    """
+    frame = pd.read_csv(path)
+    if frame.empty:
+        raise ValueError(f"{path} has no rows")
+
+    lower = {str(c).strip().lower(): c for c in frame.columns}
+
+    stamp_col = next((lower[n] for n in _TIMESTAMP_NAMES if n in lower), None)
+    if stamp_col is None:
+        raise ValueError(
+            f"no timestamp column in {path}. Looked for: {', '.join(_TIMESTAMP_NAMES)}. "
+            f"Found: {', '.join(str(c) for c in frame.columns)}"
+        )
+
+    renamed = {}
+    for target, aliases in _OHLCV_NAMES.items():
+        source = next((lower[a] for a in aliases if a in lower), None)
+        if source is None and target != "Volume":
+            raise ValueError(
+                f"no {target} column in {path}. Accepted names: {', '.join(aliases)}"
+            )
+        if source is not None:
+            renamed[source] = target
+
+    frame = frame.rename(columns=renamed)
+
+    # A file spanning a DST change carries two different offsets, which pandas
+    # refuses to parse into one naive series. Decide from the text whether the
+    # stamps are offset-aware, then take the branch that cannot silently shift
+    # them: aware stamps go through UTC, naive ones are localised with `tz`.
+    raw = frame[stamp_col].astype(str)
+    sample = next((v for v in raw if v and v.lower() != "nan"), "")
+    offset_aware = bool(re.search(r"(?:Z|[+-]\d{2}:?\d{2})$", sample.strip()))
+
+    if offset_aware:
+        stamps = pd.to_datetime(raw, errors="coerce", utc=True)
+    else:
+        stamps = pd.to_datetime(raw, errors="coerce")
+        if stamps.notna().any() and getattr(stamps.dt, "tz", None) is None:
+            stamps = stamps.dt.tz_localize(tz, ambiguous="NaT", nonexistent="NaT")
+
+    if stamps.isna().all():
+        raise ValueError(f"could not parse any timestamp in column {stamp_col!r}")
+
+    keep = stamps.notna()
+    frame = frame.loc[keep.values].copy()
+    frame.index = stamps[keep].dt.tz_convert(EASTERN)
+
+    for column in ("Open", "High", "Low", "Close"):
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    if "Volume" not in frame.columns:
+        frame["Volume"] = 0.0
+    frame["Volume"] = pd.to_numeric(frame["Volume"], errors="coerce").fillna(0.0)
+
+    frame = frame.dropna(subset=["Open", "High", "Low", "Close"])
+    frame = frame[~frame.index.duplicated(keep="first")].sort_index()
+    if frame.empty:
+        raise ValueError(f"{path} had rows but none survived parsing")
+    return frame[["Open", "High", "Low", "Close", "Volume"]]
+
+
+def _audit_bars(frame: pd.DataFrame, spec: ContractSpec, interval: str) -> list[str]:
+    """Structural complaints about a backfill file, before it is trusted.
+
+    A backfill that is quietly wrong produces a confident EV over garbage, which
+    is worse than no EV at all. These checks catch the failures that actually
+    happen: the wrong contract, the wrong timezone, and gaps large enough that
+    "60 sessions" is really 12.
+    """
+    problems = []
+
+    inconsistent = int(
+        (frame["High"] < frame[["Open", "Close"]].max(axis=1)).sum()
+        + (frame["Low"] > frame[["Open", "Close"]].min(axis=1)).sum()
+    )
+    if inconsistent:
+        problems.append(
+            f"{inconsistent} bars where High/Low do not bracket Open/Close — the file is "
+            "not clean OHLC"
+        )
+
+    expected = pd.Timedelta(interval.replace("m", "min").replace("h", "H"))
+    deltas = pd.Series(frame.index).diff().dropna()
+    if not deltas.empty:
+        modal = deltas.mode().iloc[0]
+        if modal != expected:
+            problems.append(
+                f"most common bar spacing is {modal}, but --interval says {expected}. "
+                "The scan parameters are calibrated per interval"
+            )
+
+    hours = sorted(set(frame.index.hour))
+    if 9 not in hours and 10 not in hours:
+        problems.append(
+            "no bars in the 09:00–10:59 ET range — the file is probably in a different "
+            "timezone than --tz claims, which reassigns every bar to the wrong session"
+        )
+
+    sessions = _tag_sessions(frame)
+    rth_per_session = sessions[sessions["is_rth"]].groupby("session_date").size()
+    if not rth_per_session.empty:
+        bars_expected = int(pd.Timedelta("6.5h") / expected)
+        thin = int((rth_per_session < bars_expected * 0.5).sum())
+        if thin:
+            problems.append(
+                f"{thin} of {len(rth_per_session)} sessions have under half the expected "
+                f"{bars_expected} RTH bars — partial days inflate the session count"
+            )
+
+    return problems
+
+
+def sample_projection(sessions_scanned: int, resolved: int, min_sample: int) -> str:
+    """How much more data the gate needs, at the rate this scan actually produced.
+
+    The most useful output this framework has: setups are rare, and the honest
+    answer to "when will I know if this works" is a session count, not a
+    sentiment. Quoting it stops the sample floor from looking like an arbitrary
+    obstacle and turns it into a data-acquisition target.
+    """
+    if sessions_scanned <= 0:
+        return ""
+    rate = resolved / sessions_scanned
+    if rate <= 0:
+        return (
+            f"\n> **No resolved setups in {sessions_scanned} sessions.** At this rate the gate "
+            "never opens. Either the parameters are too strict for this data, or this is not "
+            "enough history to tell — run `bin/ta smc sensitivity` before assuming the former.\n"
+        )
+    needed = max(0, min_sample - resolved)
+    if needed == 0:
+        return f"\n> Sample floor reached at {rate:.3f} resolved setups per session.\n"
+    more = needed / rate
+    return (
+        f"\n> **Rate: {rate:.3f} resolved setups per session.** {needed} more needed, so "
+        f"roughly **{more:,.0f} further sessions** (~{more / 252:.1f} years of trading days) "
+        f"at this yield.\n>\n"
+        "> That is the real cost of validating this configuration. If it reads as too long, the "
+        "lever is the parameters — a looser `min_rr` or a wider kill zone produces more setups "
+        "per session — but changing one restarts the sample, so decide before you accumulate.\n"
+    )
+
+
+def backfill_journal(symbol: str, csv_path: str, interval: str = "5m",
+                     tz: str = EASTERN, dry_run: bool = False) -> str:
+    """Run the scanner over a local history file and journal what it resolves.
+
+    This is the only way to reach a measurable EV without waiting months. The
+    vendor serves 30 days of 5m bars and that window slides forward as fast as a
+    sample accumulates; a file you already have does not move.
+    """
+    try:
+        spec = resolve(symbol)
+    except ValueError as exc:
+        return f"<error: {exc}>"
+
+    try:
+        frame = load_ohlcv_csv(csv_path, tz)
+    except (OSError, ValueError) as exc:
+        return f"<error: {type(exc).__name__}: {exc}>"
+
+    problems = _audit_bars(frame, spec, interval)
+    config = smc_config()
+    tagged = _tag_sessions(frame)
+    sessions = sorted(tagged["session_date"].unique())
+
+    setups: list[Setup] = []
+    for session_date in sessions:
+        session_frame = tagged[tagged["session_date"] == session_date].sort_index()
+        targets = _liquidity_targets(tagged, session_date, session_frame, spec, config)
+        if not targets:
+            continue
+        setups.extend(scan_session(session_frame, spec, session_date, targets, config))
+    setups = enforce_session_rules(setups, config)
+
+    fingerprint = parameter_fingerprint(config, interval)
+    terminal = [s for s in setups if s.outcome in _TERMINAL]
+
+    header = (
+        f"## Backfill — {spec.symbol} {interval} from `{csv_path}`\n\n"
+        f"{len(frame):,} bars, {len(sessions)} sessions "
+        f"({sessions[0].date()} → {sessions[-1].date()}), timezone {tz}.\n"
+        f"Found {len(setups)} setups, {len(terminal)} terminal.\n\n"
+    )
+
+    audit = ""
+    if problems:
+        audit = (
+            "> ⚠️ **File audit found problems.** Every one of these changes what the "
+            "scan means:\n>\n"
+            + "\n".join(f"> - {p}" for p in problems)
+            + "\n>\n> Fix the file or the flags before trusting the EV below.\n\n"
+        )
+
+    from collections import Counter
+
+    histogram = Counter(s.outcome for s in setups)
+    breakdown = markdown_table(
+        ["Outcome", "Setups"],
+        [[k, str(v)] for k, v in histogram.most_common()],
+    ) + "\n\n" if histogram else ""
+
+    if dry_run:
+        preview = expected_value(terminal, spec, config)
+        return (
+            header + audit + breakdown
+            + "_Dry run — nothing written._ Re-run without `--dry-run` to journal these.\n\n"
+            + _ev_block(preview, spec)
+            + sample_projection(len(sessions), preview["n_resolved"], preview["min_sample"])
+        )
+
+    known = {row["key"] for row in load_journal()}
+    added = 0
+    MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+    with JOURNAL_PATH.open("a") as handle:
+        for setup in terminal:
+            key = journal_key(spec.symbol, interval, setup)
+            if key in known:
+                continue
+            handle.write(json.dumps({
+                "key": key, "symbol": spec.symbol, "interval": interval,
+                "fingerprint": fingerprint, "session_date": setup.session_date,
+                "direction": setup.direction, "kill_zone": setup.kill_zone,
+                "liquidity_level": setup.liquidity_level_name,
+                "entry": round(setup.entry, 4), "stop": round(setup.stop, 4),
+                "target": round(setup.target, 4),
+                "risk_points": round(setup.risk_points, 4), "rr": round(setup.rr, 4),
+                "outcome": setup.outcome, "outcome_time": setup.outcome_time,
+                "recorded_at": datetime.now().isoformat(timespec="seconds"),
+                "source": "backfill",
+                "source_file": str(csv_path),
+            }) + "\n")
+            known.add(key)
+            added += 1
+
+    rows = load_journal(spec.symbol, fingerprint)
+    ev = expected_value(_journal_rows_as_setups(rows), spec, config)
+    return (
+        header + audit
+        + breakdown
+        + f"**{added} newly journalled**, {len(terminal) - added} already present.\n"
+        f"Journal now holds {len(rows)} setups for {spec.symbol} at `{fingerprint}`.\n\n"
+        + _ev_block(ev, spec)
+        + sample_projection(len(sessions), ev["n_resolved"], ev["min_sample"])
     )
 
 
