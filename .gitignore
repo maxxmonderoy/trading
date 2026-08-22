@@ -15,6 +15,9 @@ paper/
 # decision log with outcomes and lessons
 memory/decisions.jsonl
 
+# accumulated SMC setup outcomes
+memory/smc_setups.jsonl
+
 # analysis run artifacts
 results/
 

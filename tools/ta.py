@@ -244,8 +244,22 @@ def build_parser() -> argparse.ArgumentParser:
     q = smc_sub.add_parser("ev", help="Expected value per trade in R, net of execution drag — the gate a proposal must clear")
     q.add_argument("symbol", nargs="?", default="NQ")
     q.add_argument("--interval", default="5m")
-    q.add_argument("--sessions", type=int, default=60, help="More sessions is the only way past the sample floor")
+    q.add_argument("--sessions", type=int, default=60, help="Clamped by the vendor's rolling intraday window")
+    q.add_argument("--journal", action="store_true",
+                   help="Measure over accumulated journal setups instead of one scan window")
     _add_date(q)
+
+    q = smc_sub.add_parser("journal", help="Accumulate resolved setups across runs — the only way to reach a measurable sample")
+    journal_sub = q.add_subparsers(dest="journal_command", required=True)
+
+    r = journal_sub.add_parser("record", help="Scan and append newly-resolved setups. Run daily.")
+    r.add_argument("symbol", nargs="?", default="NQ")
+    r.add_argument("--interval", default="5m")
+    r.add_argument("--sessions", type=int, default=30)
+    _add_date(r)
+
+    r = journal_sub.add_parser("status", help="What the journal holds, by parameter set")
+    r.add_argument("symbol", nargs="?", default="")
 
     q = smc_sub.add_parser("sensitivity", help="How the setup count moves with the ambiguous parameters")
     q.add_argument("symbol")
@@ -498,7 +512,11 @@ def dispatch(args: argparse.Namespace) -> str:
         if sub == "rules":
             return smc.rules_report(args.symbol, args.interval, args.sessions, args.account, date)
         if sub == "ev":
-            return smc.ev_report(args.symbol, args.interval, args.sessions, date)
+            return smc.ev_report(args.symbol, args.interval, args.sessions, date, args.journal)
+        if sub == "journal":
+            if args.journal_command == "record":
+                return smc.record_journal(args.symbol, args.interval, args.sessions, date)
+            return smc.journal_status(args.symbol)
         if sub == "sensitivity":
             return smc.sensitivity(args.symbol, args.interval, args.sessions, date)
 

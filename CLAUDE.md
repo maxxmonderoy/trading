@@ -24,6 +24,7 @@ bin/ta                 → entry point (activates .venv, loads .env)
 config.json            debate rounds, analyst roster, benchmark, horizon
 results/<TICKER>/<DATE>/   run artifacts (the state dict, as files)
 memory/decisions.jsonl     decision log with outcomes and lessons
+memory/smc_setups.jsonl    accumulated SMC setup outcomes (the EV sample)
 paper/                     paper trading book: portfolio.json, trades.jsonl, equity.jsonl
 data_cache/            OHLCV and fetch cache
 ```
@@ -133,6 +134,15 @@ These apply to every agent and to the orchestrator.
    level sweep rate from `fut level-stats` is never a substitute for a win rate —
    it is the probability the trigger fires, not the probability the trade works.
 
+   **One scan can never clear that floor.** yfinance serves 30 calendar days of
+   5m bars (~21 sessions), 60 at 15m, 180 at 1h — and the window slides forward
+   as fast as a sample would accumulate, so `--sessions 60` at 5m silently
+   returns 21. `smc journal record` persists each scan's resolved setups so the
+   population grows across runs; `smc ev --journal` measures over it. Rows carry
+   a fingerprint of the parameters that produced them and are never pooled across
+   fingerprints — changing `swing_lookback` starts a new sample, because it makes
+   a different strategy.
+
 8. **Paper fills are simulated, and their costs are real.** Every fill takes
    slippage against you, and `paper status` reports cumulative cost drag as a share
    of total P&L. Never suppress that line to make a book look better, and always
@@ -177,6 +187,9 @@ bin/ta smc explain                # operational definitions and parameters
 bin/ta smc scan NQ --sessions 20  # run the four-step state machine
 bin/ta smc rules NQ --account 10000  # with section 4 enforced and sized
 bin/ta smc ev NQ --sessions 60    # EV per trade in R, net of drag — binding gate
+bin/ta smc journal record NQ      # accumulate resolved setups — run daily
+bin/ta smc journal status         # sample progress, segmented by parameter set
+bin/ta smc ev NQ --journal        # EV over the accumulated sample
 bin/ta smc sensitivity NQ         # how setup count moves with the ambiguous params
 bin/ta smc swings NQ / smc fvg NQ
 bin/ta memory recall --ticker NVDA --query "..."

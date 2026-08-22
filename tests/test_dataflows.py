@@ -433,6 +433,114 @@ class ExpectedValueGate(unittest.TestCase):
         self.assertTrue(self._ev(setups)["passes"])
 
 
+class SetupJournal(unittest.TestCase):
+    """Accumulating a sample across runs, without pooling different strategies.
+
+    One scan can never reach the EV floor: the vendor serves 30 days of 5m bars
+    and the window slides forward as fast as a sample would grow. The journal is
+    the only route to a measurable edge that does not involve risking money.
+    """
+
+    def setUp(self):
+        from dataflows import smc
+
+        self.smc = smc
+        self._tmp = tempfile.TemporaryDirectory()
+        base = Path(self._tmp.name)
+        self._patches = [
+            mock.patch.object(smc, "MEMORY_DIR", base),
+            mock.patch.object(smc, "JOURNAL_PATH", base / "smc_setups.jsonl"),
+        ]
+        for patch in self._patches:
+            patch.start()
+
+    def tearDown(self):
+        for patch in self._patches:
+            patch.stop()
+        self._tmp.cleanup()
+
+    def _write(self, rows):
+        self.smc.JOURNAL_PATH.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    def _row(self, key, outcome="target", rr=2.0, fingerprint="aaaa111111", symbol="NQ"):
+        return {
+            "key": key, "symbol": symbol, "interval": "5m", "fingerprint": fingerprint,
+            "session_date": "2024-01-02", "direction": "long", "kill_zone": "NY",
+            "liquidity_level": "pd_low", "entry": 1.0, "stop": 0.0, "target": 2.0,
+            "risk_points": 20.0, "rr": rr, "outcome": outcome, "outcome_time": "10:00",
+            "recorded_at": "2024-01-02T10:00:00",
+        }
+
+    def test_a_setup_has_a_stable_key_across_rescans(self):
+        setup = _setup("target")
+        first = self.smc.journal_key("NQ", "5m", setup)
+        second = self.smc.journal_key("NQ", "5m", setup)
+        self.assertEqual(first, second)
+
+    def test_different_setups_get_different_keys(self):
+        a = self.smc.journal_key("NQ", "5m", _setup("target"))
+        b = _setup("target")
+        b.mss_time = "11:30"
+        self.assertNotEqual(a, self.smc.journal_key("NQ", "5m", b))
+
+    def test_changing_a_parameter_changes_the_fingerprint(self):
+        base = {"swing_lookback": 2, "min_rr": 2.0, "entry_mode": "ce"}
+        moved = dict(base, swing_lookback=3)
+        self.assertNotEqual(
+            self.smc.parameter_fingerprint(base, "5m"),
+            self.smc.parameter_fingerprint(moved, "5m"),
+        )
+
+    def test_interval_is_part_of_the_fingerprint(self):
+        config = {"swing_lookback": 2, "min_rr": 2.0}
+        self.assertNotEqual(
+            self.smc.parameter_fingerprint(config, "5m"),
+            self.smc.parameter_fingerprint(config, "15m"),
+        )
+
+    def test_journal_filters_by_symbol_and_fingerprint(self):
+        self._write([
+            self._row("a", fingerprint="aaaa111111"),
+            self._row("b", fingerprint="bbbb222222"),
+            self._row("c", symbol="ES", fingerprint="aaaa111111"),
+        ])
+        self.assertEqual(len(self.smc.load_journal()), 3)
+        self.assertEqual(len(self.smc.load_journal("NQ")), 2)
+        self.assertEqual(len(self.smc.load_journal("NQ", "aaaa111111")), 1)
+
+    def test_setups_from_different_parameters_are_never_pooled(self):
+        """Rule 6: a parameterised result is not a measurement."""
+        self._write(
+            [self._row(f"old{i}", fingerprint="oldddddddd") for i in range(40)]
+            + [self._row(f"new{i}", fingerprint="newwwwwwww") for i in range(3)]
+        )
+        current = self.smc.load_journal("NQ", "newwwwwwww")
+        self.assertEqual(len(current), 3)
+
+    def test_a_corrupt_line_loses_one_trade_not_the_record(self):
+        self.smc.JOURNAL_PATH.write_text(
+            json.dumps(self._row("a")) + "\n{ broken\n" + json.dumps(self._row("b")) + "\n"
+        )
+        self.assertEqual(len(self.smc.load_journal()), 2)
+
+    def test_ev_reads_the_journal_population(self):
+        from dataflows.futures import resolve
+
+        self._write(
+            [self._row(f"w{i}", outcome="target", rr=3.0) for i in range(12)]
+            + [self._row(f"l{i}", outcome="stopped") for i in range(12)]
+        )
+        rows = self.smc.load_journal("NQ", "aaaa111111")
+        ev = self.smc.expected_value(
+            self.smc._journal_rows_as_setups(rows), resolve("NQ"), None
+        )
+        self.assertEqual(ev["n_resolved"], 24)
+        self.assertTrue(ev["measurable"])
+
+    def test_empty_journal_reports_how_to_start_one(self):
+        self.assertIn("smc journal record", self.smc.journal_status())
+
+
 # ---------------------------------------------------------------------------
 # Formatting
 # ---------------------------------------------------------------------------

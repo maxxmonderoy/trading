@@ -32,12 +32,21 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import datetime
 from datetime import time as dtime
 
 import pandas as pd
 
-from .common import ROOT, load_config, markdown_table, unavailable
-from .futures import EASTERN, ContractSpec, _tag_sessions, compute_levels, intraday, resolve
+from .common import MEMORY_DIR, ROOT, load_config, markdown_table, unavailable
+from .futures import (
+    EASTERN,
+    VALID_INTERVALS,
+    ContractSpec,
+    _tag_sessions,
+    compute_levels,
+    intraday,
+    resolve,
+)
 
 _DEFAULT_SMC = {
     "swing_lookback": 2,
@@ -1189,9 +1198,94 @@ def _ev_block(ev: dict, spec: ContractSpec) -> str:
     )
 
 
-def ev_report(symbol: str = "NQ", interval: str = "5m", sessions: int = 60,
-              curr_date: str | None = None) -> str:
-    """Standalone EV gate over a window of sessions."""
+# ---------------------------------------------------------------------------
+# The setup journal
+# ---------------------------------------------------------------------------
+#
+# The EV gate needs ~20 resolved setups. One scan cannot supply them, and no
+# amount of waiting fixes that on its own: yfinance serves 5m bars for 30
+# calendar days (~21 sessions), and this framework produces 0-3 setups per 20
+# sessions. The vendor window slides forward as fast as the sample would grow,
+# so a single scan is permanently stuck at a handful of resolved trades.
+#
+# The journal breaks that ceiling by persisting each scan's resolved setups.
+# Run it daily and the population accumulates even though the visible window
+# does not. It is the paper-trading record for the futures side, and it is the
+# only route to a measurable edge that does not involve risking money.
+#
+# One thing it must not do is pool setups produced by different parameters.
+# Rule 6 of this project: a parameterised result is not a measurement. Change
+# `swing_lookback` and the scanner produces a different strategy, so its trades
+# belong to a different population. Every row therefore carries a fingerprint of
+# the parameters that generated it, and EV is computed per fingerprint.
+
+JOURNAL_PATH = MEMORY_DIR / "smc_setups.jsonl"
+
+_FINGERPRINT_KEYS = (
+    "swing_lookback", "sweep_return_bars", "mss_max_bars", "stop_buffer_ticks",
+    "entry_mode", "min_rr", "target_pool", "eq_tolerance_ticks",
+    "max_trades_per_session", "stop_after_losses",
+)
+
+# Outcomes that cannot change if the scan is re-run later. `open_at_end` is
+# excluded on purpose: it means the data ran out mid-trade, and tomorrow's scan
+# may resolve it to target or stopped.
+_TERMINAL = ("target", "stopped", "ambiguous", "unfilled")
+
+
+def parameter_fingerprint(config: dict, interval: str) -> str:
+    """Short hash of the parameters that decide what counts as a setup."""
+    import hashlib
+
+    payload = json.dumps(
+        {"interval": interval, **{k: config.get(k) for k in _FINGERPRINT_KEYS}},
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()[:10]
+
+
+def journal_key(symbol: str, interval: str, setup: Setup) -> str:
+    """Stable identity for one setup, so re-scanning cannot double-count it."""
+    return "|".join([
+        symbol, interval, setup.session_date, setup.direction,
+        setup.mss_time, f"{setup.entry:.4f}",
+    ])
+
+
+def load_journal(symbol: str = "", fingerprint: str = "") -> list[dict]:
+    if not JOURNAL_PATH.exists():
+        return []
+    rows = []
+    for line in JOURNAL_PATH.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # a corrupt line loses one trade, not the record
+        if symbol and row.get("symbol") != symbol:
+            continue
+        if fingerprint and row.get("fingerprint") != fingerprint:
+            continue
+        rows.append(row)
+    return rows
+
+
+def _journal_rows_as_setups(rows: list[dict]):
+    """Journal rows exposed with the three attributes `expected_value` reads."""
+    from types import SimpleNamespace
+
+    return [
+        SimpleNamespace(
+            outcome=r["outcome"], rr=float(r["rr"]), risk_points=float(r["risk_points"])
+        )
+        for r in rows
+    ]
+
+
+def record_journal(symbol: str = "NQ", interval: str = "5m", sessions: int = 30,
+                   curr_date: str | None = None) -> str:
+    """Scan, then append every newly-resolved setup that is not already recorded."""
     try:
         spec = resolve(symbol)
     except ValueError as exc:
@@ -1203,8 +1297,166 @@ def ev_report(symbol: str = "NQ", interval: str = "5m", sessions: int = 60,
         return unavailable(f"{spec.symbol} {interval}", "no intraday bars")
 
     tagged = _tag_sessions(frame)
+    served = sorted(tagged["session_date"].unique())
     setups: list[Setup] = []
-    for session_date in sorted(tagged["session_date"].unique())[-sessions:]:
+    for session_date in served[-sessions:]:
+        session_frame = tagged[tagged["session_date"] == session_date].sort_index()
+        targets = _liquidity_targets(tagged, session_date, session_frame, spec, config)
+        if not targets:
+            continue
+        setups.extend(scan_session(session_frame, spec, session_date, targets, config))
+    setups = enforce_session_rules(setups, config)
+
+    fingerprint = parameter_fingerprint(config, interval)
+    known = {row["key"] for row in load_journal()}
+
+    added, skipped_known, skipped_open = 0, 0, 0
+    MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+    with JOURNAL_PATH.open("a") as handle:
+        for setup in setups:
+            if setup.outcome not in _TERMINAL:
+                skipped_open += 1
+                continue
+            key = journal_key(spec.symbol, interval, setup)
+            if key in known:
+                skipped_known += 1
+                continue
+            handle.write(json.dumps({
+                "key": key,
+                "symbol": spec.symbol,
+                "interval": interval,
+                "fingerprint": fingerprint,
+                "session_date": setup.session_date,
+                "direction": setup.direction,
+                "kill_zone": setup.kill_zone,
+                "liquidity_level": setup.liquidity_level_name,
+                "entry": round(setup.entry, 4),
+                "stop": round(setup.stop, 4),
+                "target": round(setup.target, 4),
+                "risk_points": round(setup.risk_points, 4),
+                "rr": round(setup.rr, 4),
+                "outcome": setup.outcome,
+                "outcome_time": setup.outcome_time,
+                "recorded_at": datetime.now().isoformat(timespec="seconds"),
+            }) + "\n")
+            known.add(key)
+            added += 1
+
+    rows = load_journal(spec.symbol, fingerprint)
+    ev = expected_value(_journal_rows_as_setups(rows), spec, config)
+    remaining = max(0, ev["min_sample"] - ev["n_resolved"])
+
+    return (
+        f"## Journal — {spec.symbol} {interval}\n\n"
+        f"Scanned {len(served[-sessions:])} sessions "
+        f"({served[0].date()} → {served[-1].date()}), found {len(setups)} setups.\n\n"
+        f"- **{added} newly recorded**\n"
+        f"- {skipped_known} already in the journal\n"
+        f"- {skipped_open} still open (not terminal — they may resolve on a later run)\n\n"
+        f"Journal now holds **{len(rows)} setups** for {spec.symbol} at fingerprint "
+        f"`{fingerprint}`, of which **{ev['n_resolved']} are resolved**.\n\n"
+        + (f"**{remaining} more resolved setups needed** before the EV gate can be computed.\n"
+           if remaining else f"Sample floor reached — `bin/ta smc ev {spec.symbol} --journal` is now measurable.\n")
+        + f"\n_Run this daily. The vendor serves only {VALID_INTERVALS.get(interval, '?')} "
+        f"days of {interval} bars, so the journal is the only way the sample grows._\n"
+    )
+
+
+def journal_status(symbol: str = "") -> str:
+    """What the journal holds, segmented by the parameters that produced it."""
+    rows = load_journal(symbol)
+    if not rows:
+        return (
+            "_Journal is empty._\n\n"
+            "Start it with `bin/ta smc journal record NQ`, then run that daily. "
+            "The EV gate stays closed until the sample floor is reached."
+        )
+
+    groups: dict[tuple, list[dict]] = {}
+    for row in rows:
+        groups.setdefault((row["symbol"], row["interval"], row["fingerprint"]), []).append(row)
+
+    config = smc_config()
+    table_rows = []
+    for (sym, interval, fingerprint), group in sorted(groups.items()):
+        current = fingerprint == parameter_fingerprint(config, interval)
+        resolved = [r for r in group if r["outcome"] in ("target", "stopped", "ambiguous")]
+        wins = len([r for r in group if r["outcome"] == "target"])
+        dates = sorted(r["session_date"] for r in group)
+        table_rows.append([
+            sym, interval, fingerprint + (" ←current" if current else ""),
+            f"{dates[0]} → {dates[-1]}",
+            str(len(group)), str(len(resolved)),
+            f"{wins}/{len(resolved)}" if resolved else "—",
+        ])
+
+    stale = len(groups) - sum(
+        1 for (s, i, f) in groups if f == parameter_fingerprint(config, i)
+    )
+    note = ""
+    if stale:
+        note = (
+            f"\n> ⚠️ **{stale} of {len(groups)} groups were produced by parameters that no longer "
+            "match `config.json`.** Those setups describe a different strategy and are not pooled "
+            "into the current EV. Changing a parameter restarts the sample.\n"
+        )
+
+    return (
+        "## SMC setup journal\n\n"
+        + markdown_table(
+            ["Symbol", "Interval", "Params", "Sessions covered", "Setups", "Resolved", "Wins"],
+            table_rows,
+        )
+        + f"\n\n**{len(rows)} setups recorded across {len(groups)} parameter set(s).**\n"
+        + note
+    )
+
+
+def ev_report(symbol: str = "NQ", interval: str = "5m", sessions: int = 60,
+              curr_date: str | None = None, from_journal: bool = False) -> str:
+    """Standalone EV gate, over a scan window or over the accumulated journal."""
+    try:
+        spec = resolve(symbol)
+    except ValueError as exc:
+        return f"<error: {exc}>"
+
+    config = smc_config()
+    cost_note = (
+        f"_Costs: {spec.typical_spread_ticks:.0f}-tick spread + "
+        f"${spec.commission_round_turn:,.2f} commission per round turn, from "
+        f"`config.json: futures.costs`. Replace those with your broker's actual fills — "
+        f"every number above moves with them._\n"
+    )
+
+    if from_journal:
+        fingerprint = parameter_fingerprint(config, interval)
+        rows = load_journal(spec.symbol, fingerprint)
+        if not rows:
+            return (
+                f"## Expected value — {spec.symbol} {interval}, from journal\n\n"
+                f"_No journalled setups for {spec.symbol} at the current parameters "
+                f"(`{fingerprint}`)._\n\n"
+                f"Record some with `bin/ta smc journal record {spec.symbol}`, then run it daily.\n"
+            )
+        ev = expected_value(_journal_rows_as_setups(rows), spec, config)
+        dates = sorted(r["session_date"] for r in rows)
+        return (
+            f"## Expected value — {spec.symbol} {interval}, from journal\n\n"
+            f"{len(rows)} setups recorded, sessions {dates[0]} → {dates[-1]}, "
+            f"parameters `{fingerprint}`.\n\n"
+            f"{_ev_block(ev, spec)}\n{cost_note}"
+        )
+
+    frame = intraday(spec, interval, curr_date=curr_date)
+    if frame.empty:
+        return unavailable(f"{spec.symbol} {interval}", "no intraday bars")
+
+    tagged = _tag_sessions(frame)
+    served_sessions = sorted(tagged["session_date"].unique())
+    window = served_sessions[-sessions:]
+
+    setups: list[Setup] = []
+    for session_date in window:
         session_frame = tagged[tagged["session_date"] == session_date].sort_index()
         targets = _liquidity_targets(tagged, session_date, session_frame, spec, config)
         if not targets:
@@ -1213,13 +1465,26 @@ def ev_report(symbol: str = "NQ", interval: str = "5m", sessions: int = 60,
 
     setups = enforce_session_rules(setups, config)
     ev = expected_value(setups, spec, config)
+
+    # The request is silently clamped by the vendor's rolling intraday window,
+    # and a caller who asked for 60 sessions and got 21 would otherwise read the
+    # small sample as a property of the strategy rather than of the data source.
+    clamp_note = ""
+    if len(window) < sessions:
+        vendor_days = VALID_INTERVALS.get(interval)
+        clamp_note = (
+            f"\n> ⚠️ **Asked for {sessions} sessions, the vendor served {len(window)}.** "
+            f"yfinance keeps only {vendor_days} calendar days of {interval} bars, and that "
+            "window slides forward as fast as a sample would accumulate. A single scan "
+            f"cannot reach the {ev['min_sample']}-setup floor at this interval.\n>\n"
+            f"> Use `bin/ta smc journal record {spec.symbol} --interval {interval}` daily to "
+            f"accumulate setups across runs, then `bin/ta smc ev {spec.symbol} --journal`. "
+            "A coarser interval also buys history: 15m serves 60 days, 1h serves 180.\n"
+        )
+
     return (
-        f"## Expected value — {spec.symbol} {interval}, last {sessions} sessions\n\n"
-        f"{_ev_block(ev, spec)}\n"
-        f"_Costs: {spec.typical_spread_ticks:.0f}-tick spread + "
-        f"${spec.commission_round_turn:,.2f} commission per round turn, from "
-        f"`config.json: futures.costs`. Replace those with your broker's actual fills — "
-        f"every number above moves with them._\n"
+        f"## Expected value — {spec.symbol} {interval}, {len(window)} sessions\n\n"
+        f"{_ev_block(ev, spec)}{clamp_note}\n{cost_note}"
     )
 
 
