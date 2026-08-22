@@ -23,6 +23,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import pandas as pd
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
@@ -431,6 +433,125 @@ class ExpectedValueGate(unittest.TestCase):
 
         self.assertFalse(expected_value(setups, self.spec, strict)["passes"])
         self.assertTrue(self._ev(setups)["passes"])
+
+
+class ScaledExits(unittest.TestCase):
+    """Partial take-profit, and the continuous outcomes it produces.
+
+    Banking half at 1R and stopping the runner at breakeven returns about
+    +0.5R — neither a win nor a loss. That is the whole reason `realized_r`
+    exists, and why EV is measured as its mean rather than decomposed into a
+    win rate and an average winner.
+    """
+
+    def setUp(self):
+        from dataflows import smc
+        from dataflows.futures import resolve
+
+        self.smc = smc
+        self.spec = resolve("MNQ")
+        self.config = {"scaling": {
+            "enabled": True, "tp1_r": 1.0, "tp1_fraction": 0.5,
+            "breakeven_offset_ticks": 1.0, "min_rr": 1.2,
+        }}
+
+    def _frame(self, bars):
+        """bars: list of (high, low). Index is irrelevant to the resolver."""
+        return pd.DataFrame(
+            {"High": [b[0] for b in bars], "Low": [b[1] for b in bars]},
+            index=pd.date_range("2024-01-02 09:30", periods=len(bars), freq="5min",
+                                tz="America/New_York"),
+        )
+
+    def _long(self, rr=2.0):
+        setup = _setup("unresolved", rr=rr, risk_points=10.0)
+        setup.direction = "long"
+        setup.entry, setup.stop = 100.0, 90.0
+        setup.target = 100.0 + rr * 10.0
+        setup.outcome = "unresolved"
+        return setup
+
+    def test_tp1_then_breakeven_is_a_partial_win(self):
+        setup = self._long()
+        # fill at 100, run to 110 (1R), come back and take the BE stop.
+        frame = self._frame([(101, 99), (111, 105), (106, 95)])
+        self.smc._resolve_outcome(setup, frame, -1, 0.25, self.config)
+        self.assertEqual(setup.outcome, "scaled_breakeven")
+        self.assertTrue(setup.tp1_hit)
+        # 0.5 x 1R banked, runner out at breakeven + 1 tick.
+        self.assertAlmostEqual(setup.realized_r, 0.5 * 1.0 + 0.5 * (0.25 / 10.0), places=6)
+
+    def test_stopped_before_tp1_is_a_full_loss(self):
+        setup = self._long()
+        frame = self._frame([(101, 99), (100, 89)])
+        self.smc._resolve_outcome(setup, frame, -1, 0.25, self.config)
+        self.assertEqual(setup.outcome, "stopped")
+        self.assertFalse(setup.tp1_hit)
+        self.assertEqual(setup.realized_r, -1.0)
+
+    def test_running_to_target_blends_both_exits(self):
+        setup = self._long(rr=2.0)
+        frame = self._frame([(101, 99), (111, 105), (121, 112)])
+        self.smc._resolve_outcome(setup, frame, -1, 0.25, self.config)
+        self.assertEqual(setup.outcome, "target")
+        self.assertAlmostEqual(setup.realized_r, 0.5 * 1.0 + 0.5 * 2.0, places=6)
+
+    def test_a_bar_spanning_stop_and_tp1_stays_ambiguous(self):
+        setup = self._long()
+        frame = self._frame([(101, 99), (111, 89)])
+        self.smc._resolve_outcome(setup, frame, -1, 0.25, self.config)
+        self.assertEqual(setup.outcome, "ambiguous")
+
+    def test_shorts_resolve_symmetrically(self):
+        setup = self._long()
+        setup.direction, setup.entry, setup.stop = "short", 100.0, 110.0
+        setup.target = 80.0
+        frame = self._frame([(101, 99), (95, 89), (105, 94)])
+        self.smc._resolve_outcome(setup, frame, -1, 0.25, self.config)
+        self.assertEqual(setup.outcome, "scaled_breakeven")
+        self.assertGreater(setup.realized_r, 0)
+
+    def test_disabling_scaling_restores_binary_outcomes(self):
+        setup = self._long()
+        off = {"scaling": dict(self.config["scaling"], enabled=False)}
+        frame = self._frame([(101, 99), (111, 105), (106, 95)])
+        self.smc._resolve_outcome(setup, frame, -1, 0.25, off)
+        self.assertFalse(setup.tp1_hit)
+        self.assertNotEqual(setup.outcome, "scaled_breakeven")
+
+    def test_the_floor_can_never_sit_below_tp1(self):
+        """TP1 beyond the runner's own target would be incoherent."""
+        settings = self.smc.scaling_settings(
+            {"scaling": {"enabled": True, "tp1_r": 1.5, "min_rr": 1.0}}
+        )
+        self.assertGreaterEqual(settings["min_rr"], settings["tp1_r"])
+
+    def test_ev_measures_mean_realized_r(self):
+        from types import SimpleNamespace
+
+        setups = [
+            SimpleNamespace(outcome="scaled_breakeven", rr=2.0, risk_points=20.0, realized_r=0.5)
+            for _ in range(20)
+        ]
+        ev = self.smc.expected_value(setups, self.spec, None)
+        self.assertTrue(ev["measurable"])
+        self.assertAlmostEqual(ev["gross_ev_r"], 0.5, places=6)
+
+    def test_partial_wins_are_not_counted_as_full_wins(self):
+        from types import SimpleNamespace
+
+        partial = [
+            SimpleNamespace(outcome="scaled_breakeven", rr=3.0, risk_points=20.0, realized_r=0.5)
+            for _ in range(20)
+        ]
+        full = [
+            SimpleNamespace(outcome="target", rr=3.0, risk_points=20.0, realized_r=3.0)
+            for _ in range(20)
+        ]
+        self.assertLess(
+            self.smc.expected_value(partial, self.spec, None)["gross_ev_r"],
+            self.smc.expected_value(full, self.spec, None)["gross_ev_r"],
+        )
 
 
 class SetupJournal(unittest.TestCase):

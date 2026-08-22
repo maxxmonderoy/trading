@@ -38,6 +38,14 @@
         "05:00"
       ]
     },
+    "scaling": {
+      "_comment": "Scaled take-profit. Banks tp1_fraction at tp1_r and moves the stop to breakeven plus a tick, so a setup whose nearest opposing liquidity sits under min_rr becomes tradeable instead of rejected. Outcomes stop being binary, so EV is measured as mean realized R.",
+      "enabled": true,
+      "tp1_r": 1.0,
+      "tp1_fraction": 0.5,
+      "breakeven_offset_ticks": 1.0,
+      "min_rr": 1.2
+    },
     "ev_gate": {
       "_comment": "Expected-value gate. EV is measured from the scanner's own resolved setups, not from level base rates — a level's sweep frequency is not this strategy's win rate. Fails closed below min_sample: an unmeasured edge is not a passing one.",
       "min_ev_r": 0.25,

@@ -231,6 +231,12 @@ class Setup:
     outcome_time: str = ""
     notes: list[str] = field(default_factory=list)
 
+    # Scaled exits make the result continuous rather than win/lose: banking half
+    # at 1R and stopping the runner at breakeven is neither. `realized_r` is the
+    # actual R the trade returned, and it is what EV is measured over when set.
+    realized_r: float | None = None
+    tp1_hit: bool = False
+
 
 _STATES = ("IDLE", "MONITOR_HTF_LEVELS", "AWAIT_MSS", "SET_ENTRY_ORDER", "EXECUTION_MONITOR")
 
@@ -486,17 +492,19 @@ def scan_session(
                 risk_ticks=risk_points / tick,
             )
 
-            if rr < config["min_rr"]:
+            scaling = scaling_settings(config)
+            floor = scaling["min_rr"] if scaling["enabled"] else config["min_rr"]
+            if rr < floor:
                 setup.outcome = "rejected"
                 setup.notes.append(
-                    f"R:R {rr:.2f} is below the {config['min_rr']:.1f} minimum — "
+                    f"R:R {rr:.2f} is below the {floor:.1f} minimum — "
                     f"nearest opposing liquidity ({target_name}) is too close to justify the risk."
                 )
                 setups.append(setup)
                 state, swept = "MONITOR_HTF_LEVELS", None
                 continue
 
-            _resolve_outcome(setup, frame, i, tick)
+            _resolve_outcome(setup, frame, i, tick, config)
             setups.append(setup)
             state, swept = "MONITOR_HTF_LEVELS", None
 
@@ -539,54 +547,129 @@ def _opposing_liquidity(targets: dict[str, float], entry: float, direction: str)
     return name, candidates[name]
 
 
-def _resolve_outcome(setup: Setup, frame: pd.DataFrame, mss_index: int, tick: float) -> None:
+_SCALING_DEFAULTS = {
+    "enabled": True,
+    "tp1_r": 1.0,
+    "tp1_fraction": 0.5,
+    "breakeven_offset_ticks": 1.0,
+    "min_rr": 1.2,
+}
+
+
+def scaling_settings(config: dict | None = None) -> dict:
+    settings = dict(_SCALING_DEFAULTS)
+    settings.update((config or smc_config()).get("scaling", {}))
+    # TP1 beyond the runner's own target is incoherent, so the floor can never
+    # sit below where the first exit is taken.
+    settings["min_rr"] = max(float(settings["min_rr"]), float(settings["tp1_r"]))
+    return settings
+
+
+def _resolve_outcome(setup: Setup, frame: pd.DataFrame, mss_index: int, tick: float,
+                     config: dict | None = None) -> None:
     """Walk forward from the MSS to see whether the limit filled, then what hit first.
 
     Within-bar ordering is unknowable from OHLC alone. When a bar spans both stop
     and target, this records `ambiguous` rather than guessing — assuming the
     favourable one is the single most common way a backtest flatters itself.
+
+    With scaling enabled the trade has three states rather than two: running
+    full size, running a runner after `tp1_fraction` came off at `tp1_r`, and
+    done. The second state is why `realized_r` exists — a trade that banks half
+    at 1R and then stops the runner at breakeven returns about +0.5R, which is
+    neither a win nor a loss and cannot be represented by a win rate.
     """
+    scaling = scaling_settings(config)
     highs = frame["High"].astype(float).to_numpy()
     lows = frame["Low"].astype(float).to_numpy()
+    short = setup.direction == "short"
+    sign = -1.0 if short else 1.0
+
+    tp1_price = setup.entry + sign * scaling["tp1_r"] * setup.risk_points
+    # Breakeven plus a tick, so a runner stopped out still covers its own friction.
+    be_price = setup.entry + sign * scaling["breakeven_offset_ticks"] * tick
+    be_r = (scaling["breakeven_offset_ticks"] * tick) / setup.risk_points if setup.risk_points else 0.0
+    fraction = float(scaling["tp1_fraction"])
+
     filled_at = None
+    stop_price = setup.stop
+
+    def stamp(j):
+        return str(frame.index[j].strftime("%Y-%m-%d %H:%M"))
 
     for j in range(mss_index + 1, len(frame)):
         if filled_at is None:
-            reached = (
-                highs[j] >= setup.entry if setup.direction == "short"
-                else lows[j] <= setup.entry
-            )
+            reached = highs[j] >= setup.entry if short else lows[j] <= setup.entry
             if reached:
                 filled_at = j
                 setup.outcome = "filled"
-                setup.outcome_time = str(frame.index[j].strftime("%Y-%m-%d %H:%M"))
+                setup.outcome_time = stamp(j)
                 # A bar can fill the limit and hit the stop; check from this bar on.
             else:
                 continue
 
-        hit_stop = (
-            highs[j] >= setup.stop if setup.direction == "short"
-            else lows[j] <= setup.stop
-        )
-        hit_target = (
-            lows[j] <= setup.target if setup.direction == "short"
-            else highs[j] >= setup.target
-        )
+        hit_stop = highs[j] >= stop_price if short else lows[j] <= stop_price
+        hit_target = lows[j] <= setup.target if short else highs[j] >= setup.target
+
+        if not scaling["enabled"]:
+            if hit_stop and hit_target:
+                setup.outcome, setup.outcome_time = "ambiguous", stamp(j)
+                setup.notes.append(
+                    "Stop and target both traded within one bar — OHLC cannot order them. "
+                    "Counted as neither; resolving it needs tick data."
+                )
+                return
+            if hit_stop:
+                setup.outcome, setup.outcome_time = "stopped", stamp(j)
+                setup.realized_r = -1.0
+                return
+            if hit_target:
+                setup.outcome, setup.outcome_time = "target", stamp(j)
+                setup.realized_r = setup.rr
+                return
+            continue
+
+        if not setup.tp1_hit:
+            hit_tp1 = lows[j] <= tp1_price if short else highs[j] >= tp1_price
+            if hit_stop and hit_tp1:
+                setup.outcome, setup.outcome_time = "ambiguous", stamp(j)
+                setup.notes.append(
+                    "Stop and first target both traded within one bar — OHLC cannot order "
+                    "them. Counted as neither; resolving it needs tick data."
+                )
+                return
+            if hit_stop:
+                setup.outcome, setup.outcome_time = "stopped", stamp(j)
+                setup.realized_r = -1.0
+                return
+            if hit_tp1:
+                setup.tp1_hit = True
+                stop_price = be_price
+                setup.notes.append(
+                    f"TP1: {fraction:.0%} closed at {scaling['tp1_r']:.1f}R, stop to breakeven "
+                    f"+{scaling['breakeven_offset_ticks']:.0f} tick."
+                )
+                # The same bar can reach TP1 and then run to the final target.
+                if hit_target:
+                    setup.outcome, setup.outcome_time = "target", stamp(j)
+                    setup.realized_r = fraction * scaling["tp1_r"] + (1 - fraction) * setup.rr
+                    return
+            continue
+
+        # Runner only, stop now at breakeven.
         if hit_stop and hit_target:
-            setup.outcome = "ambiguous"
-            setup.outcome_time = str(frame.index[j].strftime("%Y-%m-%d %H:%M"))
+            setup.outcome, setup.outcome_time = "ambiguous", stamp(j)
             setup.notes.append(
-                "Stop and target both traded within one bar — OHLC cannot order them. "
-                "Counted as neither; resolving it needs tick data."
+                "Breakeven stop and target both traded within one bar on the runner."
             )
             return
         if hit_stop:
-            setup.outcome = "stopped"
-            setup.outcome_time = str(frame.index[j].strftime("%Y-%m-%d %H:%M"))
+            setup.outcome, setup.outcome_time = "scaled_breakeven", stamp(j)
+            setup.realized_r = fraction * scaling["tp1_r"] + (1 - fraction) * be_r
             return
         if hit_target:
-            setup.outcome = "target"
-            setup.outcome_time = str(frame.index[j].strftime("%Y-%m-%d %H:%M"))
+            setup.outcome, setup.outcome_time = "target", stamp(j)
+            setup.realized_r = fraction * scaling["tp1_r"] + (1 - fraction) * setup.rr
             return
 
     if filled_at is None:
@@ -594,7 +677,10 @@ def _resolve_outcome(setup: Setup, frame: pd.DataFrame, mss_index: int, tick: fl
         setup.notes.append("Limit at the FVG was never reached before the data ended.")
     else:
         setup.outcome = "open_at_end"
-        setup.notes.append("Filled but neither stop nor target hit before the data ended.")
+        setup.notes.append(
+            "Filled but neither stop nor target hit before the data ended."
+            + (" TP1 was banked." if setup.tp1_hit else "")
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1049,6 +1135,19 @@ _EV_DEFAULTS = {
 }
 
 
+def _as_full_loss(setup):
+    """An ambiguous bar graded conservatively: the trade is charged a full stop.
+
+    Copied rather than mutated so re-running the calculation with
+    `ambiguous_as_loss` off gives the original number back.
+    """
+    from copy import copy
+
+    charged = copy(setup)
+    charged.realized_r = -1.0
+    return charged
+
+
 def ev_settings(config: dict | None = None) -> dict:
     settings = dict(_EV_DEFAULTS)
     settings.update((config or smc_config()).get("ev_gate", {}))
@@ -1086,13 +1185,29 @@ def expected_value(setups: list[Setup], spec: ContractSpec, config: dict | None 
     favourable fill.
     """
     settings = ev_settings(config)
-    wins = [s for s in setups if s.outcome == "target"]
-    losses = [s for s in setups if s.outcome == "stopped"]
     ambiguous = [s for s in setups if s.outcome == "ambiguous"]
-    if settings["ambiguous_as_loss"]:
-        losses = losses + ambiguous
 
-    resolved = wins + losses
+    # With scaled exits the result is a number, not a side: a trade that banks
+    # half at 1R and stops its runner at breakeven returns about +0.5R and is
+    # neither a win nor a loss. When realized R is available it is measured
+    # directly, and the win rate becomes a description rather than an input.
+    scaled = [s for s in setups if getattr(s, "realized_r", None) is not None]
+    graded = [s for s in scaled if s.outcome != "ambiguous"]
+    if settings["ambiguous_as_loss"]:
+        graded = graded + [
+            _as_full_loss(s) for s in scaled if s.outcome == "ambiguous"
+        ]
+
+    if graded:
+        wins = [s for s in graded if s.realized_r > 0]
+        losses = [s for s in graded if s.realized_r <= 0]
+        resolved = graded
+    else:
+        wins = [s for s in setups if s.outcome == "target"]
+        losses = [s for s in setups if s.outcome == "stopped"]
+        if settings["ambiguous_as_loss"]:
+            losses = losses + ambiguous
+        resolved = wins + losses
     n = len(resolved)
 
     cost_r_values = []
@@ -1132,8 +1247,15 @@ def expected_value(setups: list[Setup], spec: ContractSpec, config: dict | None 
         return result
 
     p_win = len(wins) / n
-    mean_r_win = sum(s.rr for s in wins) / len(wins) if wins else 0.0
-    gross_ev_r = p_win * mean_r_win - (1 - p_win) * 1.0
+    if graded:
+        # Mean realized R *is* the expected value per trade. No decomposition
+        # into a win rate and an average winner is needed, and none would be
+        # correct once partial exits put mass between -1R and the full target.
+        mean_r_win = sum(s.realized_r for s in wins) / len(wins) if wins else 0.0
+        gross_ev_r = sum(s.realized_r for s in graded) / n
+    else:
+        mean_r_win = sum(s.rr for s in wins) / len(wins) if wins else 0.0
+        gross_ev_r = p_win * mean_r_win - (1 - p_win) * 1.0
     net_ev_r = gross_ev_r - mean_cost_r
     passes = net_ev_r >= settings["min_ev_r"]
 
@@ -1231,7 +1353,7 @@ _FINGERPRINT_KEYS = (
 # Outcomes that cannot change if the scan is re-run later. `open_at_end` is
 # excluded on purpose: it means the data ran out mid-trade, and tomorrow's scan
 # may resolve it to target or stopped.
-_TERMINAL = ("target", "stopped", "ambiguous", "unfilled")
+_TERMINAL = ("target", "stopped", "ambiguous", "unfilled", "scaled_breakeven")
 
 
 def parameter_fingerprint(config: dict, interval: str) -> str:
@@ -1278,7 +1400,8 @@ def _journal_rows_as_setups(rows: list[dict]):
 
     return [
         SimpleNamespace(
-            outcome=r["outcome"], rr=float(r["rr"]), risk_points=float(r["risk_points"])
+            outcome=r["outcome"], rr=float(r["rr"]), risk_points=float(r["risk_points"]),
+            realized_r=None if r.get("realized_r") is None else float(r["realized_r"]),
         )
         for r in rows
     ]
@@ -1338,6 +1461,8 @@ def record_journal(symbol: str = "NQ", interval: str = "5m", sessions: int = 30,
                 "rr": round(setup.rr, 4),
                 "outcome": setup.outcome,
                 "outcome_time": setup.outcome_time,
+                "realized_r": setup.realized_r,
+                "tp1_hit": setup.tp1_hit,
                 "recorded_at": datetime.now().isoformat(timespec="seconds"),
             }) + "\n")
             known.add(key)
@@ -1607,6 +1732,7 @@ def backfill_journal(symbol: str, csv_path: str, interval: str = "5m",
                 "target": round(setup.target, 4),
                 "risk_points": round(setup.risk_points, 4), "rr": round(setup.rr, 4),
                 "outcome": setup.outcome, "outcome_time": setup.outcome_time,
+                "realized_r": setup.realized_r, "tp1_hit": setup.tp1_hit,
                 "recorded_at": datetime.now().isoformat(timespec="seconds"),
                 "source": "backfill",
                 "source_file": str(csv_path),

@@ -150,13 +150,31 @@ These apply to every agent and to the orchestrator.
    strategy: it is the difference between "validate in a month" and "validate in
    two years", and it is the number most likely to change what you build next.
 
-8. **Paper fills are simulated, and their costs are real.** Every fill takes
+   **Widen the sample by changing the strategy, never by counting the same event
+   twice.** Scaled exits (`smc.scaling`) lower the R:R floor and roughly double
+   the resolved rate, because a setup whose nearest opposing liquidity sits under
+   `min_rr` becomes tradeable rather than rejected. Scanning the same instrument
+   on several timeframes does not: on the current sample, 3m and 5m produced
+   eight setups covering four distinct (session, level, direction) events — a
+   2.0× inflation of `n` with no new information. Correlated instruments (ES/NQ/
+   YM/RTY) fail the same way for the same reason. If you scan more than one
+   symbol or timeframe, journal them under separate fingerprints and never pool
+   them into one EV.
+
+8. **A scaled exit is not a win, and the EV must not pretend otherwise.** With
+   `smc.scaling` on, a trade that banks half at 1R and stops its runner at
+   breakeven returns about +0.5R. That is neither a win nor a loss, so outcomes
+   carry `realized_r` and EV is the mean of it. Decomposing into a win rate and
+   an average winner is wrong once partial exits put mass between −1R and the
+   target; the win rate survives only as a description.
+
+9. **Paper fills are simulated, and their costs are real.** Every fill takes
    slippage against you, and `paper status` reports cumulative cost drag as a share
    of total P&L. Never suppress that line to make a book look better, and always
    compare the book to benchmark buy-and-hold — active management that trails the
    index is a losing book no matter how good the write-ups read.
 
-9. **The disclaimer ships with every decision:**
+10. **The disclaimer ships with every decision:**
 
    > This is research output from an experimental multi-agent system, not
    > financial advice. LLM agents fabricate, data sources fail silently, and a
