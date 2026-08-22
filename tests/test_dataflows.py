@@ -520,6 +520,33 @@ class ScaledExits(unittest.TestCase):
         self.assertFalse(setup.tp1_hit)
         self.assertNotEqual(setup.outcome, "scaled_breakeven")
 
+    def test_the_fill_bar_never_credits_a_favourable_exit(self):
+        """A bar that both fills the limit and runs 1R cannot be ordered from OHLC.
+
+        Crediting it is the same optimistic assumption the scanner refuses to
+        make for stop-versus-target, and on a 365-session sample it was worth
+        roughly 0.15R per trade.
+        """
+        setup = self._long()
+        # One bar dips to the 100 limit AND reaches the 110 TP1.
+        frame = self._frame([(111, 99), (104, 102)])
+        self.smc._resolve_outcome(setup, frame, -1, 0.25, self.config)
+        self.assertFalse(setup.tp1_hit)
+
+    def test_the_fill_bar_still_charges_the_stop(self):
+        """Deliberately asymmetric: adverse events count from the fill bar."""
+        setup = self._long()
+        frame = self._frame([(101, 89)])
+        self.smc._resolve_outcome(setup, frame, -1, 0.25, self.config)
+        self.assertEqual(setup.outcome, "stopped")
+        self.assertEqual(setup.realized_r, -1.0)
+
+    def test_a_later_bar_credits_tp1_normally(self):
+        setup = self._long()
+        frame = self._frame([(101, 99), (111, 105), (106, 95)])
+        self.smc._resolve_outcome(setup, frame, -1, 0.25, self.config)
+        self.assertTrue(setup.tp1_hit)
+
     def test_the_floor_can_never_sit_below_tp1(self):
         """TP1 beyond the runner's own target would be incoherent."""
         settings = self.smc.scaling_settings(
@@ -844,6 +871,16 @@ class BinanceLoader(unittest.TestCase):
         us = pd.Series([1704067200000000])
         self.assertEqual(self.crypto._to_utc(ms).iloc[0].year, 2024)
         self.assertEqual(self.crypto._to_utc(us).iloc[0].year, 2024)
+
+    def test_mixed_epoch_units_in_one_download(self):
+        """A multi-month pull can straddle Binance's ms-to-us switch.
+
+        Inferring one unit for the whole concatenation put the archives on the
+        far side of it in the year 58000.
+        """
+        mixed = pd.Series([1704067200000, 1704067200000000, 1706745600000])
+        out = self.crypto._to_utc(mixed)
+        self.assertTrue((out.dt.year == 2024).all(), out.tolist())
 
     def test_months_back_excludes_the_current_month(self):
         """Binance publishes a month's archive only after it closes."""

@@ -611,8 +611,15 @@ def _resolve_outcome(setup: Setup, frame: pd.DataFrame, mss_index: int, tick: fl
             else:
                 continue
 
+        # Adverse events count from the fill bar; favourable ones only from the
+        # next. A bar that both fills the limit and runs to target cannot be
+        # ordered from OHLC, and crediting it is the same optimistic assumption
+        # the scanner already refuses to make for stop-versus-target. Charging
+        # the stop on the fill bar while withholding the target is deliberately
+        # asymmetric — it errs toward the result that loses money.
+        favourable = j > filled_at
         hit_stop = highs[j] >= stop_price if short else lows[j] <= stop_price
-        hit_target = lows[j] <= setup.target if short else highs[j] >= setup.target
+        hit_target = favourable and (lows[j] <= setup.target if short else highs[j] >= setup.target)
 
         if not scaling["enabled"]:
             if hit_stop and hit_target:
@@ -633,7 +640,7 @@ def _resolve_outcome(setup: Setup, frame: pd.DataFrame, mss_index: int, tick: fl
             continue
 
         if not setup.tp1_hit:
-            hit_tp1 = lows[j] <= tp1_price if short else highs[j] >= tp1_price
+            hit_tp1 = favourable and (lows[j] <= tp1_price if short else highs[j] >= tp1_price)
             if hit_stop and hit_tp1:
                 setup.outcome, setup.outcome_time = "ambiguous", stamp(j)
                 setup.notes.append(

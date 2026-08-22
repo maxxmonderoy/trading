@@ -87,15 +87,19 @@ def _parse_archive(payload: bytes) -> pd.DataFrame:
 def _to_utc(series: pd.Series) -> pd.Series:
     """Binance timestamps are epoch ms, but newer archives switched to µs.
 
-    Guessing wrong puts every bar in 1970 or in the year 57000, so the unit is
-    inferred from magnitude rather than assumed.
+    Classified per value, not per file. A multi-month download can straddle the
+    switch, and inferring one unit for the whole concatenation puts the archives
+    on the far side of it in the year 58000 — which then crashes the reporting
+    rather than quietly skewing it, but only by luck.
     """
     numeric = pd.to_numeric(series, errors="coerce")
-    sample = numeric.dropna()
-    if sample.empty:
-        return pd.to_datetime(numeric, unit="ms", utc=True)
-    unit = "us" if float(sample.iloc[0]) > 1e14 else "ms"
-    return pd.to_datetime(numeric, unit=unit, utc=True)
+    micros = numeric > 1e14
+    out = pd.Series(pd.NaT, index=numeric.index, dtype="datetime64[ns, UTC]")
+    if micros.any():
+        out[micros] = pd.to_datetime(numeric[micros], unit="us", utc=True)
+    if (~micros).any():
+        out[~micros] = pd.to_datetime(numeric[~micros], unit="ms", utc=True)
+    return out
 
 
 def fetch_klines(symbol: str = "BTCUSDT", interval: str = "5m", months: int = 12,
@@ -141,6 +145,20 @@ def fetch_klines(symbol: str = "BTCUSDT", interval: str = "5m", months: int = 12
     frame = pd.concat(frames, ignore_index=True)
     frame["timestamp"] = _to_utc(frame["open_time"])
     frame = frame.dropna(subset=["timestamp"])
+
+    # A kline archive cannot contain bars from before Binance existed or from
+    # the future. Anything outside that window is a decoding failure, and
+    # letting it through would silently redefine what the backfill window covers.
+    floor = pd.Timestamp("2017-01-01", tz="UTC")
+    ceiling = pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=2)
+    implausible = int(((frame["timestamp"] < floor) | (frame["timestamp"] > ceiling)).sum())
+    frame = frame[(frame["timestamp"] >= floor) & (frame["timestamp"] <= ceiling)]
+    if frame.empty:
+        return unavailable(
+            f"Binance {symbol} {interval}",
+            f"every timestamp decoded outside {floor.date()}–{ceiling.date()} — "
+            "the archive layout has changed and open_time is no longer where it was",
+        )
     for column in ("open", "high", "low", "close", "volume"):
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
     frame = frame.dropna(subset=["open", "high", "low", "close"])
@@ -159,6 +177,12 @@ def fetch_klines(symbol: str = "BTCUSDT", interval: str = "5m", months: int = 12
 
     span_days = (frame["timestamp"].iloc[-1] - frame["timestamp"].iloc[0]).days
     notes = []
+    if implausible:
+        notes.append(
+            f"> ⚠️ **{implausible:,} bars dropped as undecodable timestamps** — outside "
+            f"{floor.date()}–{ceiling.date()}. Check for an archive layout change before "
+            "trusting the span above."
+        )
     if missing:
         notes.append(f"> **{len(missing)} month(s) not published**: {', '.join(missing)}.")
     if failed:
