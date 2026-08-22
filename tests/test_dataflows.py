@@ -20,6 +20,7 @@ import json
 import sys
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 from unittest import mock
 
@@ -746,6 +747,141 @@ class BackfillLoader(unittest.TestCase):
         )
         frame = self.smc.load_ohlcv_csv(path, "America/New_York")
         self.assertTrue(frame.index.is_monotonic_increasing)
+
+
+class CryptoSessionModel(unittest.TestCase):
+    """A 24/7 market measured with a session-based framework.
+
+    The session concepts are redefined rather than borrowed. Faking an RTH block
+    or an overnight range on a continuous tape would dress an arbitrary slice up
+    as market structure, which is the one thing this framework must not do.
+    """
+
+    def setUp(self):
+        from dataflows import futures
+
+        self.futures = futures
+        self.btc = futures.resolve("BTCUSDT")
+        self.nq = futures.resolve("NQ")
+
+    def test_crypto_specs_resolve(self):
+        self.assertTrue(self.btc.is_crypto)
+        self.assertFalse(self.nq.is_crypto)
+        self.assertEqual(self.btc.session_model, "utc_day")
+
+    def test_sessions_cut_on_the_utc_day_not_the_globex_open(self):
+        evening = pd.Timestamp("2024-01-02 20:00", tz="America/New_York")
+        # Globex: an 8pm ET bar belongs to the NEXT trade date.
+        self.assertEqual(
+            self.futures._session_date(evening, "globex").date().isoformat(), "2024-01-03"
+        )
+        # UTC day: 20:00 ET is 01:00 UTC on the 3rd, so the same bar is the 3rd.
+        self.assertEqual(
+            self.futures._session_date(evening, "utc_day").date().isoformat(), "2024-01-03"
+        )
+        # And a bar that is mid-afternoon ET is still the same UTC day.
+        noon = pd.Timestamp("2024-01-02 12:00", tz="America/New_York")
+        self.assertEqual(
+            self.futures._session_date(noon, "utc_day").date().isoformat(), "2024-01-02"
+        )
+
+    def test_every_crypto_bar_is_in_session(self):
+        frame = pd.DataFrame(
+            {"Open": [1.0] * 6, "High": [1.0] * 6, "Low": [1.0] * 6, "Close": [1.0] * 6},
+            index=pd.date_range("2024-01-02 00:00", periods=6, freq="4h", tz="UTC"),
+        )
+        tagged = self.futures._tag_sessions(frame, self.btc)
+        self.assertTrue(tagged["is_rth"].all())
+
+    def test_futures_still_separate_rth_from_overnight(self):
+        frame = pd.DataFrame(
+            {"Open": [1.0] * 6, "High": [1.0] * 6, "Low": [1.0] * 6, "Close": [1.0] * 6},
+            index=pd.date_range("2024-01-02 00:00", periods=6, freq="4h",
+                                tz="America/New_York"),
+        )
+        tagged = self.futures._tag_sessions(frame, self.nq)
+        self.assertFalse(tagged["is_rth"].all())
+
+    def test_notional_fees_scale_with_price(self):
+        """A percentage fee is a different number at $30k than at $90k."""
+        self.assertLess(
+            self.btc.round_trip_cost(30_000), self.btc.round_trip_cost(90_000)
+        )
+
+    def test_flat_commission_products_ignore_price(self):
+        self.assertEqual(self.nq.round_trip_cost(18_000), self.nq.round_trip_cost(1))
+
+    def test_omitting_price_omits_the_notional_component(self):
+        """Better to understate than to invent a price to charge against."""
+        self.assertLess(self.btc.round_trip_cost(), self.btc.round_trip_cost(42_000))
+
+    def test_overnight_levels_are_dropped_for_crypto(self):
+        from dataflows import smc
+
+        frame = pd.DataFrame(
+            {"Open": [100.0] * 576, "High": [101.0] * 576,
+             "Low": [99.0] * 576, "Close": [100.0] * 576},
+            index=pd.date_range("2024-01-01", periods=576, freq="5min", tz="UTC"),
+        )
+        tagged = self.futures._tag_sessions(frame, self.btc)
+        session = sorted(tagged["session_date"].unique())[-1]
+        targets = smc._liquidity_targets(tagged, session, spec=self.btc)
+        self.assertNotIn("ONH", targets)
+        self.assertNotIn("ONL", targets)
+
+
+class BinanceLoader(unittest.TestCase):
+    """Parsing the bulk archives. The network half is not under test."""
+
+    def setUp(self):
+        from dataflows import crypto
+
+        self.crypto = crypto
+
+    def test_epoch_units_are_inferred_not_assumed(self):
+        """Binance switched some archives from ms to µs; guessing puts bars in 1970."""
+        ms = pd.Series([1704067200000])
+        us = pd.Series([1704067200000000])
+        self.assertEqual(self.crypto._to_utc(ms).iloc[0].year, 2024)
+        self.assertEqual(self.crypto._to_utc(us).iloc[0].year, 2024)
+
+    def test_months_back_excludes_the_current_month(self):
+        """Binance publishes a month's archive only after it closes."""
+        months = self.crypto._months_back(3)
+        self.assertEqual(len(months), 3)
+        self.assertNotIn(date.today().strftime("%Y-%m"), months)
+        self.assertEqual(months, sorted(months))
+
+    def test_archive_url_shape(self):
+        url = self.crypto._archive_url("BTCUSDT", "5m", "2024-01", "futures")
+        self.assertIn("futures/um/monthly/klines/BTCUSDT/5m/", url)
+        self.assertTrue(url.endswith("BTCUSDT-5m-2024-01.zip"))
+        spot = self.crypto._archive_url("BTCUSDT", "5m", "2024-01", "spot")
+        self.assertIn("/spot/monthly/", spot)
+
+    def test_headerless_archives_are_parsed(self):
+        import io as _io
+        import zipfile
+
+        row = "1704067200000,42000.0,42100.0,41900.0,42050.0,1.5,1704067499999,63000,10,0.7,29000,0\n"
+        buffer = _io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("BTCUSDT-5m-2024-01.csv", row)
+        frame = self.crypto._parse_archive(buffer.getvalue())
+        self.assertEqual(list(frame.columns)[:6], self.crypto.KLINE_COLUMNS[:6])
+        self.assertEqual(float(frame["high"].iloc[0]), 42100.0)
+
+    def test_archives_with_headers_are_parsed(self):
+        import io as _io
+        import zipfile
+
+        text = (",".join(self.crypto.KLINE_COLUMNS) + "\n"
+                "1704067200000,42000.0,42100.0,41900.0,42050.0,1.5,1704067499999,63000,10,0.7,29000,0\n")
+        buffer = _io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("BTCUSDT-5m-2024-01.csv", text)
+        frame = self.crypto._parse_archive(buffer.getvalue())
+        self.assertEqual(float(frame["low"].iloc[0]), 41900.0)
 
 
 class SampleProjection(unittest.TestCase):

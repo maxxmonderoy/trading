@@ -18,7 +18,7 @@ replace the CLI, and a keyless Python CLI replaces the LangChain tool bindings.
 .claude/agents/        12 subagents — one per desk seat
 .claude/commands/      /analyze, /quick, /reflect
 tools/ta.py            the data layer CLI (argparse dispatcher)
-tools/dataflows/       market, fundamentals, news, social, macro, memory, paper, futures, smc
+tools/dataflows/       market, fundamentals, news, social, macro, memory, paper, futures, smc, crypto
 tests/                 offline tests for the data layer's decision logic
 bin/ta                 → entry point (activates .venv, loads .env)
 config.json            debate rounds, analyst roster, benchmark, horizon
@@ -161,20 +161,32 @@ These apply to every agent and to the orchestrator.
    symbol or timeframe, journal them under separate fingerprints and never pool
    them into one EV.
 
-8. **A scaled exit is not a win, and the EV must not pretend otherwise.** With
+8. **Crypto buys a sample, not an answer about NQ.** `bin/ta crypto klines`
+   pulls years of Binance 5m bars in one pass, which clears the EV sample floor
+   immediately instead of in two years — but a 24/7 market has no exchange
+   session, so the framework's structure is redefined rather than borrowed: a
+   session is one UTC day, prior-day extremes are that day's, and overnight
+   levels are dropped because there is no overnight. Costs change shape too —
+   Binance charges basis points of notional per side, so one BTC contract pays
+   ~$38 a round turn against NQ's flat ~$9, and that fee is charged against each
+   setup's own entry price rather than a blended one. A result here is evidence
+   about this state machine on crypto. What transfers to NQ is the mechanism;
+   the liquidity structure does not.
+
+9. **A scaled exit is not a win, and the EV must not pretend otherwise.** With
    `smc.scaling` on, a trade that banks half at 1R and stops its runner at
    breakeven returns about +0.5R. That is neither a win nor a loss, so outcomes
    carry `realized_r` and EV is the mean of it. Decomposing into a win rate and
    an average winner is wrong once partial exits put mass between −1R and the
    target; the win rate survives only as a description.
 
-9. **Paper fills are simulated, and their costs are real.** Every fill takes
+10. **Paper fills are simulated, and their costs are real.** Every fill takes
    slippage against you, and `paper status` reports cumulative cost drag as a share
    of total P&L. Never suppress that line to make a book look better, and always
    compare the book to benchmark buy-and-hold — active management that trails the
    index is a losing book no matter how good the write-ups read.
 
-10. **The disclaimer ships with every decision:**
+11. **The disclaimer ships with every decision:**
 
    > This is research output from an experimental multi-agent system, not
    > financial advice. LLM agents fabricate, data sources fail silently, and a
@@ -214,6 +226,10 @@ bin/ta smc rules NQ --account 10000  # with section 4 enforced and sized
 bin/ta smc ev NQ --sessions 60    # EV per trade in R, net of drag — binding gate
 bin/ta smc journal record NQ      # accumulate resolved setups — run daily
 bin/ta smc journal backfill NQ --csv nq_5m.csv   # scan local history into the journal
+
+# Crypto (Binance perps) — deep history, no vendor window, no key
+bin/ta crypto klines BTCUSDT --months 24   # bulk 5m archives -> one CSV
+bin/ta smc journal backfill BTCUSDT --csv data_cache/BTCUSDT_5m_24m.csv
 bin/ta smc journal status         # sample progress, segmented by parameter set
 bin/ta smc ev NQ --journal        # EV over the accumulated sample
 bin/ta smc sensitivity NQ         # how setup count moves with the ambiguous params

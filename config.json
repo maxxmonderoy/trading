@@ -71,6 +71,14 @@
     },
     "target_pool": "htf"
   },
+  "crypto": {
+    "_comment": "Binance USDT-M perpetual costs. Fees are a share of NOTIONAL per side, so at BTC prices they dominate every other cost term and dwarf a tight stop. 4.5 bps is standard taker; maker is ~2.0, and lower again with BNB or volume tiers. This single number decides whether a 5m crypto strategy can clear its own costs — set it to what you actually pay.",
+    "costs": {
+      "BTCUSDT": { "fee_bps_per_side": 4.5, "spread_ticks": 1.0 },
+      "ETHUSDT": { "fee_bps_per_side": 4.5, "spread_ticks": 1.0 },
+      "SOLUSDT": { "fee_bps_per_side": 4.5, "spread_ticks": 1.0 }
+    }
+  },
   "futures": {
     "_comment": "YOUR broker's costs. These feed every R:R and cost-drag number. Defaults are assumed retail all-in per round turn \u2014 replace with your actual fills.",
     "costs": {

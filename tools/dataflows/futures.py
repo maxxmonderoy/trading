@@ -60,6 +60,12 @@ class ContractSpec:
     typical_spread_ticks: float
     commission_round_turn: float  # ASSUMED retail all-in; verify with your broker
     exchange: str = "CME"
+    # Crypto venues charge a share of notional rather than a flat ticket, and at
+    # BTC prices that dominates every other cost term. Zero for CME contracts.
+    fee_bps_per_side: float = 0.0
+    # "globex" tags sessions on the 18:00 ET open; "utc_day" is one UTC calendar
+    # day, for markets that never close.
+    session_model: str = "globex"
 
     @property
     def tick_value(self) -> float:
@@ -72,9 +78,23 @@ class ContractSpec:
     def notional(self, price: float) -> float:
         return price * self.multiplier
 
-    def round_trip_cost(self) -> float:
-        """Spread crossed once plus commission — the real cost of a round turn."""
-        return self.typical_spread_ticks * self.tick_value + self.commission_round_turn
+    @property
+    def is_crypto(self) -> bool:
+        return self.session_model == "utc_day"
+
+    def round_trip_cost(self, price: float | None = None) -> float:
+        """Spread crossed once plus commission — the real cost of a round turn.
+
+        A percentage fee needs a price to become a number. Callers that have one
+        (every setup knows its entry) should pass it; without it the notional
+        component is omitted, which understates crypto costs rather than
+        inventing a price to charge against.
+        """
+        cost = self.typical_spread_ticks * self.tick_value + self.commission_round_turn
+        if self.fee_bps_per_side and price:
+            notional = price * self.multiplier
+            cost += notional * (self.fee_bps_per_side / 10_000) * 2
+        return cost
 
     def ticks_to_dollars(self, ticks: float, contracts: int = 1) -> float:
         return ticks * self.tick_value * contracts
@@ -111,6 +131,27 @@ def _build_specs() -> dict[str, ContractSpec]:
         spread_ticks, commission = cost(symbol, default_commission)
         built[symbol] = ContractSpec(
             symbol, data_symbol, name, multiplier, tick, spread_ticks, commission
+        )
+
+    # Binance USDT-M perpetuals. One contract is one coin, and the venue charges
+    # a share of notional per side rather than a ticket — at BTC prices that fee
+    # dwarfs every other cost term, which is exactly why it is modelled and not
+    # folded into a flat number.
+    crypto_costs = load_config().get("crypto", {}).get("costs", {})
+    for symbol, name, multiplier, tick, default_bps in [
+        ("BTCUSDT", "Binance BTC/USDT perpetual", 1.0, 0.1, 4.5),
+        ("ETHUSDT", "Binance ETH/USDT perpetual", 1.0, 0.01, 4.5),
+        ("SOLUSDT", "Binance SOL/USDT perpetual", 1.0, 0.01, 4.5),
+    ]:
+        entry = crypto_costs.get(symbol, {})
+        built[symbol] = ContractSpec(
+            symbol=symbol, data_symbol=symbol, name=name,
+            multiplier=multiplier, tick_points=tick,
+            typical_spread_ticks=float(entry.get("spread_ticks", 1.0)),
+            commission_round_turn=0.0,
+            exchange="Binance",
+            fee_bps_per_side=float(entry.get("fee_bps_per_side", default_bps)),
+            session_model="utc_day",
         )
     return built
 
@@ -196,21 +237,38 @@ def intraday(spec: ContractSpec, interval: str = "5m", days: int | None = None,
     return frame.sort_index()
 
 
-def _session_date(timestamp: pd.Timestamp) -> pd.Timestamp:
+def _session_date(timestamp: pd.Timestamp, model: str = "globex") -> pd.Timestamp:
     """The trade date a bar belongs to.
 
     Globex opens at 18:00 ET for the *next* trade date, so an 8pm Sunday bar is
     Monday's session. Getting this wrong silently corrupts every overnight level.
+
+    A 24/7 market has no such boundary. `utc_day` cuts on the UTC calendar day
+    instead — which is the convention crypto desks actually use, and makes
+    "prior day high" mean the previous UTC day's extreme. It is a chosen
+    boundary, not a structural one, and the reports say so.
     """
+    if model == "utc_day":
+        return timestamp.tz_convert("UTC").normalize().tz_localize(None)
     if (timestamp.hour, timestamp.minute) >= GLOBEX_OPEN:
         return (timestamp + pd.Timedelta(days=1)).normalize()
     return timestamp.normalize()
 
 
-def _tag_sessions(frame: pd.DataFrame) -> pd.DataFrame:
-    """Label each bar with its trade date and whether it is RTH or overnight."""
+def _tag_sessions(frame: pd.DataFrame, spec: ContractSpec | None = None) -> pd.DataFrame:
+    """Label each bar with its trade date and whether it is RTH or overnight.
+
+    On a market that never closes there is no regular-trading-hours window to
+    separate out, so every bar is in-session. Faking an RTH block for crypto
+    would make `rth_high` and the overnight levels look like real structure when
+    they are an arbitrary slice of a continuous tape.
+    """
+    model = spec.session_model if spec is not None else "globex"
     out = frame.copy()
-    out["session_date"] = [_session_date(t) for t in out.index]
+    out["session_date"] = [_session_date(t, model) for t in out.index]
+    if model == "utc_day":
+        out["is_rth"] = True
+        return out
     minutes = out.index.hour * 60 + out.index.minute
     rth_start = RTH_OPEN[0] * 60 + RTH_OPEN[1]
     rth_end = RTH_CLOSE[0] * 60 + RTH_CLOSE[1]
@@ -300,7 +358,7 @@ def levels_report(symbol: str, curr_date: str | None = None, interval: str = "5m
             f"{VALID_INTERVALS[interval]} days — a dated run older than that cannot be served",
         )
 
-    tagged = _tag_sessions(frame)
+    tagged = _tag_sessions(frame, spec)
     sessions = sorted(tagged["session_date"].unique())
     session_date = sessions[-1]
     levels = compute_levels(tagged, session_date)
@@ -409,7 +467,7 @@ def level_stats(symbol: str, level_key: str = "pd_high", lookback: int = 60,
     if frame.empty:
         return unavailable(f"{spec.symbol} intraday", f"no {interval} bars available")
 
-    tagged = _tag_sessions(frame)
+    tagged = _tag_sessions(frame, spec)
     sessions = sorted(tagged["session_date"].unique())[-lookback:]
     upside = level_key in _UPSIDE_LEVELS
     threshold = threshold_ticks * spec.tick_points
@@ -688,7 +746,7 @@ def bars_report(symbol: str, interval: str = "5m", limit: int = 40,
             f"no {interval} bars. Intraday history is capped at {VALID_INTERVALS[interval]} days",
         )
 
-    tagged = _tag_sessions(frame).tail(limit)
+    tagged = _tag_sessions(frame, spec).tail(limit)
     rows = []
     for timestamp, row in tagged.iterrows():
         rng = float(row["High"]) - float(row["Low"])

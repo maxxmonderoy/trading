@@ -25,7 +25,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from dataflows import (  # noqa: E402
-    common, doctor, fundamentals, futures, macro, market, memory, news, paper, smc, social,
+    common, crypto, doctor, fundamentals, futures, macro, market, memory, news, paper, smc,
+    social,
 )
 
 
@@ -189,6 +190,17 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--risk-pct", type=float, default=1.0)
     q.add_argument("--stop-ticks", type=float, required=True)
     _add_date(q)
+
+    # ---- crypto -----------------------------------------------------------
+    p = sub.add_parser("crypto", help="Binance bulk history — deep intraday sample without a vendor window")
+    crypto_sub = p.add_subparsers(dest="crypto_command", required=True)
+
+    q = crypto_sub.add_parser("klines", help="Download monthly kline archives into one CSV")
+    q.add_argument("symbol", nargs="?", default="BTCUSDT")
+    q.add_argument("--interval", default="5m")
+    q.add_argument("--months", type=int, default=12, help="Complete months back from last month")
+    q.add_argument("--market", default="futures", choices=["futures", "spot"])
+    q.add_argument("--out", default=None, help="Destination CSV (default: data_cache/)")
 
     # ---- SMC framework ----------------------------------------------------
     p = sub.add_parser("smc", help="SMC/price-action framework: sweep → MSS → FVG state machine")
@@ -503,6 +515,12 @@ def dispatch(args: argparse.Namespace) -> str:
             return futures.bars_report(args.symbol, args.interval, args.limit, date)
         if sub == "size":
             return futures.position_size(args.symbol, args.account, args.risk_pct, args.stop_ticks, date)
+
+    if command == "crypto":
+        if args.crypto_command == "klines":
+            return crypto.fetch_klines(
+                args.symbol, args.interval, args.months, args.market, args.out
+            )
 
     if command == "smc":
         sub = args.smc_command

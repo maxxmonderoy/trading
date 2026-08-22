@@ -255,10 +255,13 @@ def _liquidity_targets(tagged: pd.DataFrame, session_date: pd.Timestamp,
     levels = compute_levels(tagged, session_date)
     targets: dict[str, float] = {}
 
-    for key, label in [
-        ("pd_high", "PDH"), ("pd_low", "PDL"),
-        ("on_high", "ONH"), ("on_low", "ONL"),
-    ]:
+    # A market that never closes has no overnight session, so ONH/ONL would be
+    # an arbitrary slice of a continuous tape dressed up as structure. Prior-day
+    # extremes survive the move to a UTC boundary; the overnight pair does not.
+    wanted = [("pd_high", "PDH"), ("pd_low", "PDL")]
+    if spec is None or not getattr(spec, "is_crypto", False):
+        wanted += [("on_high", "ONH"), ("on_low", "ONL")]
+    for key, label in wanted:
         if key in levels:
             targets[label] = levels[key]
 
@@ -704,7 +707,7 @@ def scan(symbol: str, interval: str = "5m", sessions: int = 10,
             "no intraday bars — this framework cannot run without them",
         )
 
-    tagged = _tag_sessions(frame)
+    tagged = _tag_sessions(frame, spec)
     all_sessions = sorted(tagged["session_date"].unique())[-sessions:]
 
     all_setups: list[Setup] = []
@@ -951,7 +954,7 @@ def sensitivity(symbol: str, interval: str = "5m", sessions: int = 20,
     if frame.empty:
         return unavailable(f"{spec.symbol} {interval}", "no intraday bars")
 
-    tagged = _tag_sessions(frame)
+    tagged = _tag_sessions(frame, spec)
     all_sessions = sorted(tagged["session_date"].unique())[-sessions:]
 
     def count(overrides: dict) -> tuple[int, int, int]:
@@ -1216,7 +1219,10 @@ def expected_value(setups: list[Setup], spec: ContractSpec, config: dict | None 
         if risk_dollars <= 0:
             continue
         slippage_ticks = settings["adverse_ticks_entry"] + settings["adverse_ticks_stop"]
-        drag = spec.round_trip_cost() + spec.ticks_to_dollars(slippage_ticks)
+        # A percentage fee is only a number once it has a price to bite on, and
+        # each setup carries its own entry. Charging a blended price here would
+        # understate costs on the trades that mattered most.
+        drag = spec.round_trip_cost(getattr(setup, "entry", None)) + spec.ticks_to_dollars(slippage_ticks)
         cost_r_values.append(drag / risk_dollars)
     mean_cost_r = sum(cost_r_values) / len(cost_r_values) if cost_r_values else 0.0
 
@@ -1402,6 +1408,7 @@ def _journal_rows_as_setups(rows: list[dict]):
         SimpleNamespace(
             outcome=r["outcome"], rr=float(r["rr"]), risk_points=float(r["risk_points"]),
             realized_r=None if r.get("realized_r") is None else float(r["realized_r"]),
+            entry=float(r.get("entry") or 0.0) or None,
         )
         for r in rows
     ]
@@ -1420,7 +1427,7 @@ def record_journal(symbol: str = "NQ", interval: str = "5m", sessions: int = 30,
     if frame.empty:
         return unavailable(f"{spec.symbol} {interval}", "no intraday bars")
 
-    tagged = _tag_sessions(frame)
+    tagged = _tag_sessions(frame, spec)
     served = sorted(tagged["session_date"].unique())
     setups: list[Setup] = []
     for session_date in served[-sessions:]:
@@ -1602,7 +1609,7 @@ def _audit_bars(frame: pd.DataFrame, spec: ContractSpec, interval: str) -> list[
             "timezone than --tz claims, which reassigns every bar to the wrong session"
         )
 
-    sessions = _tag_sessions(frame)
+    sessions = _tag_sessions(frame, spec)
     rth_per_session = sessions[sessions["is_rth"]].groupby("session_date").size()
     if not rth_per_session.empty:
         bars_expected = int(pd.Timedelta("6.5h") / expected)
@@ -1667,7 +1674,7 @@ def backfill_journal(symbol: str, csv_path: str, interval: str = "5m",
 
     problems = _audit_bars(frame, spec, interval)
     config = smc_config()
-    tagged = _tag_sessions(frame)
+    tagged = _tag_sessions(frame, spec)
     sessions = sorted(tagged["session_date"].unique())
 
     setups: list[Setup] = []
@@ -1841,7 +1848,7 @@ def ev_report(symbol: str = "NQ", interval: str = "5m", sessions: int = 60,
     if frame.empty:
         return unavailable(f"{spec.symbol} {interval}", "no intraday bars")
 
-    tagged = _tag_sessions(frame)
+    tagged = _tag_sessions(frame, spec)
     served_sessions = sorted(tagged["session_date"].unique())
     window = served_sessions[-sessions:]
 
@@ -1891,7 +1898,7 @@ def rules_report(symbol: str = "NQ", interval: str = "5m", sessions: int = 20,
     if frame.empty:
         return unavailable(f"{spec.symbol} {interval}", "no intraday bars")
 
-    tagged = _tag_sessions(frame)
+    tagged = _tag_sessions(frame, spec)
     all_sessions = sorted(tagged["session_date"].unique())[-sessions:]
 
     setups: list[Setup] = []
@@ -2182,7 +2189,7 @@ def liquidity_report(symbol: str = "NQ", interval: str = "5m",
     if frame.empty:
         return unavailable(f"{spec.symbol} {interval}", "no intraday bars")
 
-    tagged = _tag_sessions(frame)
+    tagged = _tag_sessions(frame, spec)
     session_date = sorted(tagged["session_date"].unique())[-1]
     session_frame = tagged[tagged["session_date"] == session_date].sort_index()
     targets = _liquidity_targets(tagged, session_date, session_frame, spec, config)
@@ -2276,7 +2283,7 @@ def replay(symbol: str = "NQ", session: str | None = None, until: str = "10:15",
     if frame.empty:
         return unavailable(f"{spec.symbol} {interval}", "no intraday bars")
 
-    tagged = _tag_sessions(frame)
+    tagged = _tag_sessions(frame, spec)
     available = sorted(tagged["session_date"].unique())
     if session:
         wanted = pd.Timestamp(session, tz=EASTERN).normalize()
