@@ -261,6 +261,8 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--stop-ticks", type=float, default=0.0, help="Fixed stop; default is structural (beyond the sweep extreme)")
     q.add_argument("--killzone", default="any", help="NY, London, or any")
     q.add_argument("--tz", default="America/New_York")
+    q.add_argument("--direction", default="reversal", choices=["reversal", "continuation"],
+                   help="Does the sweep reverse, or break out? The framework assumes reversal.")
 
     q = smc_sub.add_parser("ev", help="Expected value per trade in R, net of execution drag — the gate a proposal must clear")
     q.add_argument("symbol", nargs="?", default="NQ")
@@ -551,7 +553,7 @@ def dispatch(args: argparse.Namespace) -> str:
             return smc.rules_report(args.symbol, args.interval, args.sessions, args.account, date)
         if sub == "probe":
             return smc.probe(args.symbol, args.csv, args.level, args.targets,
-                             args.stop_ticks, args.killzone, args.tz)
+                             args.stop_ticks, args.killzone, args.tz, args.direction)
         if sub == "ev":
             return smc.ev_report(args.symbol, args.interval, args.sessions, date, args.journal)
         if sub == "journal":

@@ -1774,7 +1774,7 @@ _PROBE_LEVELS = {
 
 def probe(symbol: str, csv_path: str, level_key: str = "pd_high",
           targets: str = "1.0,1.5,2.0", stop_ticks: float = 0.0,
-          killzone: str = "any", tz: str = EASTERN) -> str:
+          killzone: str = "any", tz: str = EASTERN, direction: str = "reversal") -> str:
     """Raw base rate for ONE sweep, before any state machine is layered on.
 
     The four-step scanner answers "does sweep → MSS → FVG work". It cannot
@@ -1805,8 +1805,15 @@ def probe(symbol: str, csv_path: str, level_key: str = "pd_high",
         return f"<error: {type(exc).__name__}: {exc}>"
 
     config = smc_config()
-    label, direction = _PROBE_LEVELS[level_key]
-    short = direction == "short"
+    label, natural = _PROBE_LEVELS[level_key]
+    # Which side the level sits on is a property of the level and decides what
+    # counts as a sweep event. Which way the trade faces is the hypothesis.
+    # Conflating them silently changes the event population when the direction
+    # flips, so the two comparisons stop being over the same setups.
+    level_is_upside = natural == "short"
+    if direction == "continuation":
+        natural = "long" if natural == "short" else "short"
+    short = natural == "short"
     sign = -1.0 if short else 1.0
     target_rs = [float(t) for t in targets.split(",") if t.strip()]
 
@@ -1834,7 +1841,7 @@ def probe(symbol: str, csv_path: str, level_key: str = "pd_high",
 
         # A session that opens beyond the level never traded into the resting
         # orders — there is no sweep event to measure.
-        if (short and closes[0] > level) or (not short and closes[0] < level):
+        if (level_is_upside and closes[0] > level) or (not level_is_upside and closes[0] < level):
             gapped += 1
             continue
 
@@ -1842,7 +1849,7 @@ def probe(symbol: str, csv_path: str, level_key: str = "pd_high",
         for i in range(len(session)):
             if killzone != "any" and kill_zone_for(session.index[i], config) != killzone:
                 continue
-            if (short and highs[i] > level) or (not short and lows[i] < level):
+            if (level_is_upside and highs[i] > level) or (not level_is_upside and lows[i] < level):
                 pierce = i
                 break
         if pierce is None:
@@ -1914,7 +1921,7 @@ def probe(symbol: str, csv_path: str, level_key: str = "pd_high",
     median_risk = sorted(t["risk_points"] for t in trades)[len(trades) // 2]
     return f"""## Sweep probe — {spec.symbol} {label}, {len(sessions)} sessions
 
-Entry on the close of the bar that first pierces {label}\
+{direction.capitalize()} trade. Entry on the close of the bar that first pierces {label}\
 {f" during the {killzone} kill zone" if killzone != "any" else ""}. \
 Stop {'at a fixed ' + str(stop_ticks) + ' ticks' if stop_ticks else 'beyond the sweep extreme'}. \
 No structure confirmation, no gap entry — whatever edge appears here belongs to the sweep alone.
